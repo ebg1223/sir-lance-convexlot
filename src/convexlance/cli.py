@@ -5,6 +5,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 import json
 import os
+import signal
 import socket
 import time
 from typing import Any
@@ -19,6 +20,26 @@ TypeKind = str
 
 class LeaseUnavailable(RuntimeError):
     pass
+
+
+class GracefulShutdown(BaseException):
+    pass
+
+
+def _signal_name(signum: int) -> str:
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return str(signum)
+
+
+def request_shutdown(signum: int, _frame: Any) -> None:
+    raise GracefulShutdown(_signal_name(signum))
+
+
+def install_signal_handlers() -> None:
+    signal.signal(signal.SIGTERM, request_shutdown)
+    signal.signal(signal.SIGINT, request_shutdown)
 
 
 def log_event(event: str, **fields: Any) -> None:
@@ -823,6 +844,9 @@ def run_incremental_once(args: argparse.Namespace) -> JsonMap:
         state.delete("incremental/last_error.json")
         log_event("lance_incremental_completed", pages=pages, rows_seen=rows_seen, rows_accepted=rows_accepted, rows_merged=rows_merged, tables=len(table_rows), start_cursor=start_cursor, end_cursor=cursor)
         return {"pages": pages, "rows_seen": rows_seen, "rows_accepted": rows_accepted, "rows_merged": rows_merged, "tables": sorted(source_to_physical_table(table) for table in table_rows), "start_cursor": start_cursor, "end_cursor": cursor}
+    except GracefulShutdown as exc:
+        log_event("lance_incremental_shutdown_requested", signal=str(exc), start_cursor=start_cursor, last_cursor=cursor)
+        raise
     except BaseException as exc:
         state.write("incremental/last_error.json", {"owner": lease.owner, "error": repr(exc), "start_cursor": start_cursor, "last_cursor": cursor, "updated_at": int(time.time())})
         raise
@@ -853,6 +877,9 @@ def run_incremental_loop(args: argparse.Namespace) -> None:
                 optimized = run_idle_maintenance_once(args, _incremental_state(args))
         except LeaseUnavailable as exc:
             log_event("lance_incremental_lock_unavailable", error=str(exc))
+        except GracefulShutdown as exc:
+            log_event("lance_incremental_loop_stopped", signal=str(exc))
+            break
         if not optimized:
             time.sleep(args.sleep_seconds)
 
@@ -1120,6 +1147,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    install_signal_handlers()
     args = build_parser().parse_args()
     args.func(args)
 

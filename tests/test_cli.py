@@ -6,7 +6,10 @@ from convexlance.cli import (
     build_parser,
     create_indexes_for_columns,
     generated_index_columns,
+    GracefulShutdown,
+    install_signal_handlers,
     prepare_incremental_merge_rows,
+    request_shutdown,
     schema_column_specs,
 )
 
@@ -76,6 +79,13 @@ class ConvexLanceCliTest(unittest.TestCase):
         self.assertEqual(rows[0]["__id_ts"], "a#100")
         self.assertEqual(rows[0]["__status"], 0)
         self.assertEqual(rows[0]["__status_id"], "0#a")
+
+    def test_signal_handler_raises_graceful_shutdown(self):
+        with self.assertRaisesRegex(GracefulShutdown, "SIGTERM"):
+            request_shutdown(15, None)
+
+    def test_install_signal_handlers(self):
+        install_signal_handlers()
 
 
 if __name__ == "__main__":
