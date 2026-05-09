@@ -1,5 +1,0 @@
-duckdb==1.5.2
-boto3==1.43.0
-botocore[crt]==1.43.0
-pyarrow==24.0.0
-pylance==4.0.1
