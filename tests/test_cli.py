@@ -9,7 +9,9 @@ from convexlance.cli import (
     install_signal_handlers,
     prepare_incremental_merge_rows,
     request_shutdown,
+    run_idle_maintenance_once,
     schema_column_specs,
+    should_run_idle_maintenance,
     shutdown_requested,
     shutdown_signal,
     _shutdown_event,
@@ -26,6 +28,10 @@ class FakeIndexConn:
 
     def fetchall(self):
         return [("__id_ts",), ("__status_id",), ("__status",)]
+
+
+class FakeState:
+    pass
 
 
 class ConvexLanceCliTest(unittest.TestCase):
@@ -96,6 +102,18 @@ class ConvexLanceCliTest(unittest.TestCase):
 
     def test_install_signal_handlers(self):
         install_signal_handlers()
+
+    def test_idle_maintenance_skips_when_shutdown_requested(self):
+        request_shutdown(15, None)
+        args = build_parser().parse_args(["incremental-loop"])
+
+        self.assertFalse(run_idle_maintenance_once(args, FakeState()))
+
+    def test_idle_maintenance_not_selected_when_shutdown_requested(self):
+        request_shutdown(15, None)
+        args = build_parser().parse_args(["incremental-loop"])
+
+        self.assertFalse(should_run_idle_maintenance(args, {"rows_accepted": 0, "pages": 1}))
 
 
 if __name__ == "__main__":

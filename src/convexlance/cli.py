@@ -920,7 +920,12 @@ def maybe_optimize_incremental_indices(args: argparse.Namespace, touched_tables:
 
 
 def should_run_idle_maintenance(args: argparse.Namespace, stats: JsonMap) -> bool:
-    return bool(args.idle_maintenance and int(stats.get("rows_accepted", 0)) <= args.idle_maintenance_max_rows and int(stats.get("pages", 0)) <= args.idle_maintenance_max_pages)
+    return bool(
+        args.idle_maintenance
+        and not shutdown_requested()
+        and int(stats.get("rows_accepted", 0)) <= args.idle_maintenance_max_rows
+        and int(stats.get("pages", 0)) <= args.idle_maintenance_max_pages
+    )
 
 
 def maintenance_actions(args: argparse.Namespace) -> list[tuple[str, int]]:
@@ -996,6 +1001,9 @@ def choose_maintenance_work(args: argparse.Namespace, maintenance_state: JsonMap
 
 
 def run_idle_maintenance_once(args: argparse.Namespace, state: S3JsonState) -> bool:
+    if shutdown_requested():
+        log_event("lance_incremental_idle_maintenance_skipped_shutdown", signal=shutdown_signal())
+        return False
     bucket = env_or_arg(args, "lance_bucket", "LANCE_BUCKET")
     tables = list_lance_tables(argparse.Namespace(tables=args.maintenance_tables, tables_file=args.maintenance_tables_file, lance_bucket=bucket, lance_prefix=args.lance_prefix, aws_region=args.aws_region))
     maintenance_state = read_maintenance_state(state, args)
@@ -1003,6 +1011,9 @@ def run_idle_maintenance_once(args: argparse.Namespace, state: S3JsonState) -> b
     if work is None:
         return False
     action, table = work
+    if shutdown_requested():
+        log_event("lance_incremental_idle_maintenance_skipped_shutdown", signal=shutdown_signal(), action=action, table=table)
+        return False
     target_uri = lance_uri(bucket, args.lance_prefix, table)
     started = time.monotonic()
     import lance
@@ -1022,6 +1033,9 @@ def run_idle_maintenance_once(args: argparse.Namespace, state: S3JsonState) -> b
         elapsed = round(time.monotonic() - started, 3)
         maintenance_state.setdefault("last_run_by_action", {}).setdefault(action, {})[table] = int(time.time())
         audit_event = {"status": "completed", "action": action, "table": table, "target_uri": target_uri, "result": repr(result), "elapsed_seconds": elapsed}
+        if shutdown_requested():
+            audit_event["shutdown_requested"] = True
+            audit_event["shutdown_signal"] = shutdown_signal()
         log_event("lance_incremental_idle_maintenance_completed", **audit_event)
         write_maintenance_audit(state, args, audit_event)
     except Exception as exc:  # noqa: BLE001
@@ -1030,6 +1044,9 @@ def run_idle_maintenance_once(args: argparse.Namespace, state: S3JsonState) -> b
         failures.append({"action": action, "table": table, "error": repr(exc), "updated_at": int(time.time())})
         del failures[:-20]
         audit_event = {"status": "failed", "action": action, "table": table, "target_uri": target_uri, "error": repr(exc), "elapsed_seconds": elapsed}
+        if shutdown_requested():
+            audit_event["shutdown_requested"] = True
+            audit_event["shutdown_signal"] = shutdown_signal()
         log_event("lance_incremental_idle_maintenance_failed", **audit_event)
         write_maintenance_audit(state, args, audit_event)
     write_maintenance_state(state, args, maintenance_state)
