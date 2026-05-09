@@ -9,7 +9,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.11.11 /uv /uvx /bin/
 COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-dev --no-install-project
 
-COPY src/convexlance ./convexlance
+COPY src ./src
 RUN uv sync --locked --no-dev
 
 ENTRYPOINT ["uv", "run", "--no-sync", "python", "-m", "convexlance.cli"]
