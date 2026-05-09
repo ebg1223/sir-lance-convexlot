@@ -7,6 +7,7 @@ import json
 import os
 import signal
 import socket
+import threading
 import time
 from typing import Any
 import uuid
@@ -22,8 +23,8 @@ class LeaseUnavailable(RuntimeError):
     pass
 
 
-class GracefulShutdown(BaseException):
-    pass
+_shutdown_event = threading.Event()
+_shutdown_signal = ""
 
 
 def _signal_name(signum: int) -> str:
@@ -34,12 +35,22 @@ def _signal_name(signum: int) -> str:
 
 
 def request_shutdown(signum: int, _frame: Any) -> None:
-    raise GracefulShutdown(_signal_name(signum))
+    global _shutdown_signal
+    _shutdown_signal = _signal_name(signum)
+    _shutdown_event.set()
 
 
 def install_signal_handlers() -> None:
     signal.signal(signal.SIGTERM, request_shutdown)
     signal.signal(signal.SIGINT, request_shutdown)
+
+
+def shutdown_requested() -> bool:
+    return _shutdown_event.is_set()
+
+
+def shutdown_signal() -> str:
+    return _shutdown_signal
 
 
 def log_event(event: str, **fields: Any) -> None:
@@ -839,14 +850,14 @@ def run_incremental_once(args: argparse.Namespace) -> JsonMap:
                 cursor_etag = _write_incremental_cursor(state, args, cursor, cursor_etag, {"owner": lease.owner, "pages_processed": pages, "previous_cursor": page_start_cursor})
             heartbeat_lease(state, lease, args.lock_ttl_seconds)
             log_event("lance_incremental_page", page=pages, values=len(raw_rows), accepted=sum(len(v) for v in by_table.values()), cursor=cursor, has_more=has_more)
+            if shutdown_requested():
+                log_event("lance_incremental_shutdown_requested", signal=shutdown_signal(), start_cursor=start_cursor, last_cursor=cursor, pages_completed=pages)
+                break
             if pages >= args.max_pages_per_sync or not has_more:
                 break
         state.delete("incremental/last_error.json")
         log_event("lance_incremental_completed", pages=pages, rows_seen=rows_seen, rows_accepted=rows_accepted, rows_merged=rows_merged, tables=len(table_rows), start_cursor=start_cursor, end_cursor=cursor)
         return {"pages": pages, "rows_seen": rows_seen, "rows_accepted": rows_accepted, "rows_merged": rows_merged, "tables": sorted(source_to_physical_table(table) for table in table_rows), "start_cursor": start_cursor, "end_cursor": cursor}
-    except GracefulShutdown as exc:
-        log_event("lance_incremental_shutdown_requested", signal=str(exc), start_cursor=start_cursor, last_cursor=cursor)
-        raise
     except BaseException as exc:
         state.write("incremental/last_error.json", {"owner": lease.owner, "error": repr(exc), "start_cursor": start_cursor, "last_cursor": cursor, "updated_at": int(time.time())})
         raise
@@ -860,7 +871,7 @@ def run_incremental_loop(args: argparse.Namespace) -> None:
     pages_since_optimize = 0
     rows_since_optimize = 0
     last_optimized_at = time.time()
-    while True:
+    while not shutdown_requested():
         optimized = False
         try:
             stats = run_incremental_once(args)
@@ -877,11 +888,11 @@ def run_incremental_loop(args: argparse.Namespace) -> None:
                 optimized = run_idle_maintenance_once(args, _incremental_state(args))
         except LeaseUnavailable as exc:
             log_event("lance_incremental_lock_unavailable", error=str(exc))
-        except GracefulShutdown as exc:
-            log_event("lance_incremental_loop_stopped", signal=str(exc))
+        if shutdown_requested():
+            log_event("lance_incremental_loop_stopped", signal=shutdown_signal())
             break
         if not optimized:
-            time.sleep(args.sleep_seconds)
+            _shutdown_event.wait(args.sleep_seconds)
 
 
 def maybe_optimize_incremental_indices(args: argparse.Namespace, touched_tables: set[str], pages: int, rows: int, last_optimized_at: float) -> bool:
