@@ -14,6 +14,8 @@ permissions:
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
+  INFRA_REPOSITORY: ${{ vars.INFRA_REPOSITORY }}
+  INFRA_IMAGE_FILE: ${{ vars.INFRA_IMAGE_FILE }}
 
 jobs:
   build:
@@ -83,3 +85,103 @@ jobs:
         with:
           name: convexlance-image
           path: convexlance-image.json
+
+  infra-pr:
+    name: Open infra digest PR
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Check infra PR token
+        id: token
+        env:
+          TOKEN: ${{ secrets.INFRA_REPOSITORY_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping infra PR because INFRA_REPOSITORY_TOKEN is not configured." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Download image digest artifact
+        if: steps.token.outputs.configured == 'true'
+        uses: actions/download-artifact@v5
+        with:
+          name: convexlance-image
+          path: image
+
+      - name: Checkout infra repository
+        if: steps.token.outputs.configured == 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.INFRA_REPOSITORY }}
+          token: ${{ secrets.INFRA_REPOSITORY_TOKEN }}
+          path: infra
+
+      - name: Update pinned image digest
+        if: steps.token.outputs.configured == 'true'
+        id: image
+        run: |
+          REF="$(jq -r .ref image/convexlance-image.json)"
+          SOURCE_SHA="$(jq -r .source_sha image/convexlance-image.json)"
+          SHORT_SHA="${SOURCE_SHA:0:7}"
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          image = json.loads(Path("image/convexlance-image.json").read_text())
+          path = Path("infra") / os.environ["INFRA_IMAGE_FILE"]
+          text = path.read_text()
+          updated, count = re.subn(
+              r'(variable "container_image" \{[\s\S]*?default\s*=\s*")[^"]+(")',
+              rf'\1{image["ref"]}\2',
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("failed to update container_image default")
+          path.write_text(updated)
+          PY
+          {
+            echo "ref=$REF"
+            echo "source_sha=$SOURCE_SHA"
+            echo "short_sha=$SHORT_SHA"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create or update infra PR
+        if: steps.token.outputs.configured == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.INFRA_REPOSITORY_TOKEN }}
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+          SOURCE_SHA: ${{ steps.image.outputs.source_sha }}
+          SHORT_SHA: ${{ steps.image.outputs.short_sha }}
+        run: |
+          cd infra
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          BRANCH="chore/convexlance-${SHORT_SHA}"
+          git checkout -B "$BRANCH"
+          git add "$INFRA_IMAGE_FILE"
+          if git diff --cached --quiet; then
+            echo "Infra already pins $IMAGE_REF." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git commit -m "Bump Convex Lance image to ${SHORT_SHA}"
+          git push --force-with-lease origin "$BRANCH"
+          BODY="Updates \`container_image\` to the immutable Convex Lance image digest built from \`${SOURCE_SHA}\`.
+
+          Image:
+          \`\`\`
+          ${IMAGE_REF}
+          \`\`\`
+
+          Source workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if gh pr view "$BRANCH" --repo "$INFRA_REPOSITORY" >/dev/null 2>&1; then
+            gh pr edit "$BRANCH" --repo "$INFRA_REPOSITORY" --title "Bump Convex Lance image to ${SHORT_SHA}" --body "$BODY"
+          else
+            gh pr create --repo "$INFRA_REPOSITORY" --base main --head "$BRANCH" --title "Bump Convex Lance image to ${SHORT_SHA}" --body "$BODY"
+          fi
