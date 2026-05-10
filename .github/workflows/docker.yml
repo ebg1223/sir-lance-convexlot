@@ -163,7 +163,7 @@ jobs:
           cd infra
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          BRANCH="chore/convexlance-${SHORT_SHA}"
+          BRANCH="chore/convexlance-image"
           git checkout -B "$BRANCH"
           git add "$INFRA_IMAGE_FILE"
           if git diff --cached --quiet; then
@@ -181,7 +181,7 @@ jobs:
 
           Source workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           if gh pr view "$BRANCH" --repo "$INFRA_REPOSITORY" >/dev/null 2>&1; then
-            gh pr edit "$BRANCH" --repo "$INFRA_REPOSITORY" --title "Bump Convex Lance image to ${SHORT_SHA}" --body "$BODY"
+            gh pr edit "$BRANCH" --repo "$INFRA_REPOSITORY" --title "Bump Convex Lance image" --body "$BODY"
           else
-            gh pr create --repo "$INFRA_REPOSITORY" --base main --head "$BRANCH" --title "Bump Convex Lance image to ${SHORT_SHA}" --body "$BODY"
+            gh pr create --repo "$INFRA_REPOSITORY" --base main --head "$BRANCH" --title "Bump Convex Lance image" --body "$BODY"
           fi
