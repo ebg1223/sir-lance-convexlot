@@ -50,6 +50,7 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -59,3 +60,26 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Write image digest artifact
+        if: github.event_name != 'pull_request'
+        run: |
+          cat > convexlance-image.json <<JSON
+          {
+            "image": "${{ env.IMAGE_NAME }}",
+            "digest": "${{ steps.build.outputs.digest }}",
+            "ref": "${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}",
+            "source_sha": "${{ github.sha }}",
+            "tags": ${{ toJSON(steps.meta.outputs.tags) }}
+          }
+          JSON
+          cat convexlance-image.json
+          echo "### Convex Lance image" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload image digest artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v5
+        with:
+          name: convexlance-image
+          path: convexlance-image.json
