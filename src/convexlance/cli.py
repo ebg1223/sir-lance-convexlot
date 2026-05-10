@@ -4,6 +4,7 @@ import argparse
 from collections.abc import Iterable
 from dataclasses import dataclass
 import json
+import multiprocessing
 import os
 import signal
 import socket
@@ -1016,23 +1017,12 @@ def run_idle_maintenance_once(args: argparse.Namespace, state: S3JsonState) -> b
         return False
     target_uri = lance_uri(bucket, args.lance_prefix, table)
     started = time.monotonic()
-    import lance
 
     try:
-        dataset = lance.dataset(target_uri)
-        if action == "optimize_indices":
-            result = dataset.optimize.optimize_indices()
-        elif action == "compact_files":
-            result = dataset.optimize.compact_files(materialize_deletions=True, num_threads=args.maintenance_compact_threads)
-        elif action == "cleanup_old_versions":
-            from datetime import timedelta
-
-            result = dataset.cleanup_old_versions(older_than=timedelta(seconds=args.maintenance_cleanup_older_than_seconds), retain_versions=args.maintenance_retain_versions)
-        else:
-            raise ValueError(f"unknown maintenance action: {action}")
+        result = run_maintenance_action_with_timeout(args, action, target_uri)
         elapsed = round(time.monotonic() - started, 3)
         maintenance_state.setdefault("last_run_by_action", {}).setdefault(action, {})[table] = int(time.time())
-        audit_event = {"status": "completed", "action": action, "table": table, "target_uri": target_uri, "result": repr(result), "elapsed_seconds": elapsed}
+        audit_event = {"status": "completed", "action": action, "table": table, "target_uri": target_uri, "result": result, "elapsed_seconds": elapsed}
         if shutdown_requested():
             audit_event["shutdown_requested"] = True
             audit_event["shutdown_signal"] = shutdown_signal()
@@ -1043,7 +1033,8 @@ def run_idle_maintenance_once(args: argparse.Namespace, state: S3JsonState) -> b
         failures = maintenance_state.setdefault("failures", [])
         failures.append({"action": action, "table": table, "error": repr(exc), "updated_at": int(time.time())})
         del failures[:-20]
-        audit_event = {"status": "failed", "action": action, "table": table, "target_uri": target_uri, "error": repr(exc), "elapsed_seconds": elapsed}
+        status = "timed_out" if isinstance(exc, TimeoutError) else "failed"
+        audit_event = {"status": status, "action": action, "table": table, "target_uri": target_uri, "error": repr(exc), "elapsed_seconds": elapsed}
         if shutdown_requested():
             audit_event["shutdown_requested"] = True
             audit_event["shutdown_signal"] = shutdown_signal()
@@ -1051,6 +1042,60 @@ def run_idle_maintenance_once(args: argparse.Namespace, state: S3JsonState) -> b
         write_maintenance_audit(state, args, audit_event)
     write_maintenance_state(state, args, maintenance_state)
     return True
+
+
+def run_maintenance_action(args: argparse.Namespace, action: str, target_uri: str) -> str:
+    import lance
+
+    dataset = lance.dataset(target_uri)
+    if action == "optimize_indices":
+        return repr(dataset.optimize.optimize_indices())
+    if action == "compact_files":
+        return repr(dataset.optimize.compact_files(materialize_deletions=True, num_threads=args.maintenance_compact_threads))
+    if action == "cleanup_old_versions":
+        from datetime import timedelta
+
+        return repr(dataset.cleanup_old_versions(older_than=timedelta(seconds=args.maintenance_cleanup_older_than_seconds), retain_versions=args.maintenance_retain_versions))
+    raise ValueError(f"unknown maintenance action: {action}")
+
+
+def _maintenance_action_child(args: argparse.Namespace, action: str, target_uri: str, queue: multiprocessing.Queue) -> None:
+    try:
+        queue.put({"status": "completed", "result": run_maintenance_action(args, action, target_uri)})
+    except BaseException as exc:  # noqa: BLE001
+        queue.put({"status": "failed", "error": repr(exc)})
+
+
+def run_maintenance_action_with_timeout(args: argparse.Namespace, action: str, target_uri: str) -> str:
+    timeout = args.maintenance_action_timeout_seconds
+    if timeout <= 0:
+        return run_maintenance_action(args, action, target_uri)
+    queue: multiprocessing.Queue = multiprocessing.Queue(maxsize=1)
+    process = multiprocessing.Process(target=_maintenance_action_child, args=(args, action, target_uri, queue))
+    started = time.monotonic()
+    process.start()
+    while process.is_alive():
+        process.join(timeout=0.2)
+        if shutdown_requested():
+            process.terminate()
+            process.join(args.maintenance_action_kill_grace_seconds)
+            if process.is_alive():
+                process.kill()
+                process.join()
+            raise RuntimeError(f"maintenance action interrupted by {shutdown_signal()}: {action} {target_uri}")
+        if time.monotonic() - started >= timeout:
+            process.terminate()
+            process.join(args.maintenance_action_kill_grace_seconds)
+            if process.is_alive():
+                process.kill()
+                process.join()
+            raise TimeoutError(f"maintenance action timed out after {timeout}s: {action} {target_uri}")
+    if process.exitcode != 0 and queue.empty():
+        raise RuntimeError(f"maintenance action process exited with {process.exitcode}: {action} {target_uri}")
+    message = queue.get() if not queue.empty() else {"status": "failed", "error": f"missing child result exitcode={process.exitcode}"}
+    if message.get("status") != "completed":
+        raise RuntimeError(str(message.get("error")))
+    return str(message.get("result"))
 
 
 def list_lance_tables(args: argparse.Namespace) -> list[str]:
@@ -1149,6 +1194,8 @@ def add_incremental_arguments(parser: argparse.ArgumentParser, *, loop: bool) ->
         parser.add_argument("--maintenance-cleanup-older-than-seconds", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_CLEANUP_OLDER_THAN_SECONDS", "259200")))
         parser.add_argument("--maintenance-retain-versions", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_RETAIN_VERSIONS", "500")))
         parser.add_argument("--maintenance-compact-threads", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_COMPACT_THREADS", "1")))
+        parser.add_argument("--maintenance-action-timeout-seconds", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_ACTION_TIMEOUT_SECONDS", "90")))
+        parser.add_argument("--maintenance-action-kill-grace-seconds", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_ACTION_KILL_GRACE_SECONDS", "10")))
         parser.add_argument("--maintenance-heavy-window-start-utc", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_HEAVY_WINDOW_START_UTC", "7")))
         parser.add_argument("--maintenance-heavy-window-end-utc", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_HEAVY_WINDOW_END_UTC", "12")))
     parser.add_argument("--lock-ttl-seconds", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_LOCK_TTL_SECONDS", "300")))

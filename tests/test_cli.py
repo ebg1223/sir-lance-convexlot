@@ -1,7 +1,10 @@
 import contextlib
 import io
+from argparse import Namespace
+import time
 import unittest
 
+import convexlance.cli as cli
 from convexlance.cli import (
     build_parser,
     create_indexes_for_columns,
@@ -10,6 +13,7 @@ from convexlance.cli import (
     prepare_incremental_merge_rows,
     request_shutdown,
     run_idle_maintenance_once,
+    run_maintenance_action_with_timeout,
     schema_column_specs,
     should_run_idle_maintenance,
     shutdown_requested,
@@ -114,6 +118,30 @@ class ConvexLanceCliTest(unittest.TestCase):
         args = build_parser().parse_args(["incremental-loop"])
 
         self.assertFalse(should_run_idle_maintenance(args, {"rows_accepted": 0, "pages": 1}))
+
+    def test_maintenance_action_timeout_raises(self):
+        original = cli.run_maintenance_action
+
+        def slow_action(_args, _action, _target_uri):
+            time.sleep(2)
+            return "done"
+
+        cli.run_maintenance_action = slow_action
+        try:
+            args = Namespace(maintenance_action_timeout_seconds=1, maintenance_action_kill_grace_seconds=0)
+            with self.assertRaises(TimeoutError):
+                run_maintenance_action_with_timeout(args, "optimize_indices", "s3://bucket/table.lance")
+        finally:
+            cli.run_maintenance_action = original
+
+    def test_maintenance_action_timeout_disabled_runs_inline(self):
+        original = cli.run_maintenance_action
+        cli.run_maintenance_action = lambda _args, _action, _target_uri: "done"
+        try:
+            args = Namespace(maintenance_action_timeout_seconds=0, maintenance_action_kill_grace_seconds=0)
+            self.assertEqual(run_maintenance_action_with_timeout(args, "optimize_indices", "s3://bucket/table.lance"), "done")
+        finally:
+            cli.run_maintenance_action = original
 
 
 if __name__ == "__main__":
