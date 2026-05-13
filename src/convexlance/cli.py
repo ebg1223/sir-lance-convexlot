@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
+from collections import deque
 from collections.abc import Iterable
 from dataclasses import dataclass
+import hashlib
 import json
-import multiprocessing
 import os
-import signal
+import re
 import socket
-import threading
+import sys
+import tempfile
 import time
 from typing import Any
 import uuid
@@ -22,36 +25,6 @@ TypeKind = str
 
 class LeaseUnavailable(RuntimeError):
     pass
-
-
-_shutdown_event = threading.Event()
-_shutdown_signal = ""
-
-
-def _signal_name(signum: int) -> str:
-    try:
-        return signal.Signals(signum).name
-    except ValueError:
-        return str(signum)
-
-
-def request_shutdown(signum: int, _frame: Any) -> None:
-    global _shutdown_signal
-    _shutdown_signal = _signal_name(signum)
-    _shutdown_event.set()
-
-
-def install_signal_handlers() -> None:
-    signal.signal(signal.SIGTERM, request_shutdown)
-    signal.signal(signal.SIGINT, request_shutdown)
-
-
-def shutdown_requested() -> bool:
-    return _shutdown_event.is_set()
-
-
-def shutdown_signal() -> str:
-    return _shutdown_signal
 
 
 def log_event(event: str, **fields: Any) -> None:
@@ -126,6 +99,20 @@ class ColumnSpec:
     kind: TypeKind
     required: bool = False
     element_kind: TypeKind | None = None
+
+
+@dataclass(frozen=True)
+class IndexSpec:
+    column: str
+    index_type: str
+    name: str | None = None
+
+
+@dataclass(frozen=True)
+class TableConfig:
+    table_name: str
+    version: str
+    indexes: list[IndexSpec]
 
 
 class S3JsonState:
@@ -279,10 +266,37 @@ def create_lance_secret(conn: Any, scope: str, region: str | None) -> None:
     conn.execute(f"CREATE OR REPLACE SECRET lance_object_store ({', '.join(parts)})")
 
 
+def create_s3_secret(conn: Any, region: str | None) -> None:
+    parts = ["TYPE s3", "PROVIDER credential_chain"]
+    if region:
+        parts.append(f"REGION {quote_literal(region)}")
+    conn.execute(f"CREATE OR REPLACE SECRET s3tables_object_store ({', '.join(parts)})")
+
+
 def install_and_load(conn: Any, extension: str) -> None:
     conn.execute(f"INSTALL {extension}")
     conn.execute(f"LOAD {extension}")
 
+
+def open_duckdb(args: argparse.Namespace) -> Any:
+    import duckdb
+
+    conn = duckdb.connect(args.duckdb_path or ":memory:")
+    if args.threads:
+        conn.execute(f"SET threads = {int(args.threads)}")
+    if args.memory_limit:
+        conn.execute(f"SET memory_limit = {quote_literal(args.memory_limit)}")
+    if args.temp_directory:
+        conn.execute(f"SET temp_directory = {quote_literal(args.temp_directory)}")
+    for extension in ("aws", "httpfs", "iceberg", "lance"):
+        install_and_load(conn, extension)
+    create_s3_secret(conn, args.aws_region)
+    create_lance_secret(conn, args.lance_scope, args.aws_region)
+    conn.execute(
+        f"ATTACH {quote_literal(args.s3tables_warehouse_arn)} AS {quote_identifier(args.catalog_alias)} "
+        "(TYPE iceberg, ENDPOINT_TYPE s3_tables)"
+    )
+    return conn
 
 
 def open_lance_duckdb(args: argparse.Namespace) -> Any:
@@ -431,11 +445,17 @@ def infer_kind(schema: JsonMap) -> tuple[TypeKind, bool, TypeKind | None]:
     members = [m for m in _collect_union_members(core) if not _is_null_schema(m)]
     if len(members) > 1:
         inferred = [infer_kind(m)[0] for m in members]
-        if all(k in {"int64", "float64"} for k in inferred):
-            return ("float64" if "float64" in inferred else "int64", nullable, None)
-        if len(set(inferred)) == 1 and inferred[0] != "array":
-            return inferred[0], nullable, None
-        return "json", nullable, None
+        if "json" in inferred or "array" in inferred:
+            return "json", nullable, None
+        if "string" in inferred:
+            return "string", nullable, None
+        if all(k in {"bool", "int64", "float64"} for k in inferred):
+            if "float64" in inferred:
+                return "float64", nullable, None
+            if "int64" in inferred:
+                return "int64", nullable, None
+            return "bool", nullable, None
+        return "string", nullable, None
     c = expand_validator_json(members[0] if members else core)
     if c.get("x-convex") in {"any", "record"}:
         return "json", nullable, None
@@ -449,6 +469,8 @@ def infer_kind(schema: JsonMap) -> tuple[TypeKind, bool, TypeKind | None]:
             return "float64", nullable, None
         return "string", nullable, None
     t = c.get("type")
+    if t is None:
+        return "json", nullable, None
     if t == "string":
         return "string", nullable, None
     if t == "boolean":
@@ -465,7 +487,9 @@ def infer_kind(schema: JsonMap) -> tuple[TypeKind, bool, TypeKind | None]:
         if item_nullable or item_kind in {"json", "array"}:
             return "json", nullable, None
         return "array", nullable, item_kind
-    return "json", nullable, None
+    if t == "object" or c.get("x-convex") in {"any", "record"}:
+        return "json", nullable, None
+    return "string", nullable, None
 
 
 def schema_column_specs(table_schema: JsonMap) -> list[ColumnSpec]:
@@ -545,6 +569,86 @@ def prepare_incremental_merge_rows(incoming_rows: list[JsonMap], existing_curren
     return merge_rows
 
 
+def build_select_sql(conn: Any, args: argparse.Namespace, source_table: str) -> str:
+    source_ref = ".".join(
+        [
+            quote_identifier(args.catalog_alias),
+            quote_identifier(args.namespace),
+            quote_identifier(source_table),
+        ]
+    )
+    column_names = table_column_names(conn, source_ref)
+    column_set = set(column_names)
+    missing_required = required_generated_source_columns(column_set)
+    if missing_required:
+        raise RuntimeError(f"source table {source_table} missing required generated-column inputs: {sorted(missing_required)}")
+    base_columns = [column for column in column_names if column not in GENERATED_COLUMNS and column != "_current"]
+    select_list = ", ".join(quote_identifier(column) for column in base_columns)
+    sql = (
+        f"SELECT {select_list}, "
+        f"{status_expr()} AS __status, "
+        f"{status_id_expr()} AS __status_id, "
+        f"{id_ts_expr()} AS __id_ts "
+        f"FROM {source_ref}"
+    )
+    if args.where:
+        sql += f" WHERE {args.where}"
+    if args.order_by:
+        sql += f" ORDER BY {args.order_by}"
+    if args.max_rows is not None:
+        sql += f" LIMIT {int(args.max_rows)}"
+    return sql
+
+
+def run_migrate_table(args: argparse.Namespace) -> None:
+    table_name = env_or_arg(args, "table", "TABLE_NAME")
+    source_table = args.source_table or os.environ.get("ICEBERG_TABLE_NAME") or table_name
+    output_table = args.output_table or os.environ.get("LANCE_TABLE_NAME") or source_to_physical_table(table_name)
+    bucket = env_or_arg(args, "lance_bucket", "LANCE_BUCKET")
+    target_uri = args.lance_uri or lance_uri(bucket, args.lance_prefix, output_table)
+    args.lance_scope = args.lance_scope or f"s3://{bucket}/"
+    args.s3tables_warehouse_arn = env_or_arg(args, "s3tables_warehouse_arn", "S3TABLES_CATALOG_WAREHOUSE_ARN")
+    args.namespace = args.namespace or os.environ.get("S3TABLES_NAMESPACE", "convex")
+    args.catalog_alias = args.catalog_alias or os.environ.get("ICEBERG_CATALOG_ALIAS", "s3tables")
+    args.aws_region = args.aws_region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+
+    log_event(
+        "lance_migration_started",
+        source_table=source_table,
+        namespace=args.namespace,
+        target_uri=target_uri,
+        mode=args.mode,
+    )
+    started = time.monotonic()
+    conn = open_duckdb(args)
+    try:
+        select_sql = build_select_sql(conn, args, source_table)
+        conn.execute(f"COPY ({select_sql}) TO {quote_literal(target_uri)} (FORMAT lance, MODE {quote_literal(args.mode)})")
+        source_count = conn.execute(f"SELECT count(*) FROM ({select_sql})").fetchone()[0] if args.verify_count else None
+        lance_count = conn.execute(f"SELECT count(*) FROM {quote_literal(target_uri)}").fetchone()[0] if args.verify_count else None
+        if args.verify_count and source_count != lance_count:
+            raise RuntimeError(f"count mismatch source={source_count} lance={lance_count}")
+        generated_indexes = 0
+        index_skipped: list[JsonMap] = []
+        config: TableConfig | None = None
+        if args.create_generated_indexes or args.table_config_indexes:
+            requested, config = requested_index_specs(argparse.Namespace(**vars(args), generated_indexes=args.create_generated_indexes), output_table)
+            generated_indexes, index_skipped = create_indexes_for_columns(conn, output_table, quote_literal(target_uri), requested)
+            write_applied_table_config_state(table_config_state(args), output_table, config, generated_indexes, index_skipped)
+        log_event(
+            "lance_migration_completed",
+            source_table=source_table,
+            target_uri=target_uri,
+            source_count=source_count,
+            lance_count=lance_count,
+            generated_indexes=generated_indexes,
+            index_skipped=index_skipped,
+            table_config_version=config.version if config else None,
+            elapsed_seconds=round(time.monotonic() - started, 3),
+        )
+    finally:
+        conn.close()
+
 
 def _convex_client(args: argparse.Namespace) -> ConvexClient:
     convex_url = args.convex_url or os.environ.get("CONVEX_URL")
@@ -555,10 +659,10 @@ def _convex_client(args: argparse.Namespace) -> ConvexClient:
 
 
 def _incremental_state(args: argparse.Namespace) -> S3JsonState:
-    bucket = args.state_bucket or os.environ.get("LANCE_INCREMENTAL_STATE_BUCKET")
+    bucket = args.state_bucket or os.environ.get("LANCE_INCREMENTAL_STATE_BUCKET") or os.environ.get("S3TABLES_BACKFILL_STATE_BUCKET")
     prefix = args.state_prefix or os.environ.get("LANCE_INCREMENTAL_STATE_PREFIX") or "lance-incremental"
     if not bucket:
-        raise SystemExit("--state-bucket or LANCE_INCREMENTAL_STATE_BUCKET is required")
+        raise SystemExit("--state-bucket, LANCE_INCREMENTAL_STATE_BUCKET, or S3TABLES_BACKFILL_STATE_BUCKET is required")
     return S3JsonState(bucket, prefix)
 
 
@@ -620,6 +724,52 @@ def _coerce_merge_rows_for_schema(rows: list[JsonMap], column_types: dict[str, s
     return coerced_rows
 
 
+def normalize_value_for_column(value: Any, column: ColumnSpec) -> Any:
+    if value is None:
+        return None
+    if column.kind == "json":
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, separators=(",", ":"))
+        return json.dumps(value, separators=(",", ":"))
+    if column.kind == "string":
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, separators=(",", ":"))
+        return str(value)
+    if column.kind in {"int64", "int8"}:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        return None
+    if column.kind == "float64":
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
+    if column.kind == "bool":
+        return value if isinstance(value, bool) else None
+    return value
+
+
+def normalize_rows_for_specs(rows: list[JsonMap], columns: list[ColumnSpec]) -> list[JsonMap]:
+    specs = {column.name: column for column in columns}
+    normalized: list[JsonMap] = []
+    for raw in rows:
+        row = dict(raw)
+        for name, spec in specs.items():
+            if name in row:
+                row[name] = normalize_value_for_column(row[name], spec)
+        normalized.append(row)
+    return normalized
+
+
 def _coerce_rows_for_arrow_schema(rows: list[JsonMap], schema: Any) -> list[JsonMap]:
     import pyarrow.types as pat
 
@@ -665,13 +815,25 @@ def _schema_types_compatible(existing_type: Any, desired_type: Any) -> bool:
 
     if existing_type.equals(desired_type):
         return True
-    if pat.is_integer(existing_type) and pat.is_floating(desired_type):
-        return False
-    if pat.is_string(existing_type) and pat.is_string(desired_type):
+    if pat.is_integer(existing_type) and pat.is_integer(desired_type):
         return True
-    if pat.is_large_string(existing_type) and pat.is_string(desired_type):
+    if pat.is_floating(existing_type) and pat.is_floating(desired_type):
+        return True
+    if (pat.is_string(existing_type) or pat.is_large_string(existing_type)) and (pat.is_string(desired_type) or pat.is_large_string(desired_type)):
         return True
     return False
+
+
+def _schema_type_alteration(existing_type: Any, desired_type: Any) -> JsonMap | None:
+    import pyarrow.types as pat
+
+    if pat.is_integer(existing_type) and pat.is_integer(desired_type) and desired_type.bit_width > existing_type.bit_width:
+        return {"data_type": desired_type}
+    if pat.is_floating(existing_type) and pat.is_floating(desired_type) and desired_type.bit_width > existing_type.bit_width:
+        return {"data_type": desired_type}
+    if _schema_types_compatible(existing_type, desired_type):
+        return None
+    return None
 
 
 def _lance_sql_type(column: ColumnSpec) -> str:
@@ -715,7 +877,64 @@ def table_schema_from_payload(schema_payload: JsonMap, source_table: str) -> Jso
     return table_schema if isinstance(table_schema, dict) else None
 
 
-def reconcile_lance_schema(conn: Any, args: argparse.Namespace, table_name: str, target_uri: str, table_schema: JsonMap | None) -> None:
+def _dataset_column_types(dataset: Any) -> dict[str, Any]:
+    return {field.name: field.type for field in dataset.schema}
+
+
+def _add_lance_columns_native(dataset: Any, specs: list[ColumnSpec]) -> bool:
+    if not specs:
+        return True
+    add_columns = getattr(dataset, "add_columns", None)
+    if add_columns is None:
+        return False
+    import pyarrow as pa
+
+    fields = [pa.field(spec.name, _pa_type_for_column(spec), nullable=not spec.required) for spec in specs]
+    try:
+        add_columns(pa.schema(fields))
+    except TypeError:
+        add_columns(fields)
+    return True
+
+
+def _add_lance_columns_duckdb(args: argparse.Namespace, target_uri: str, specs: list[ColumnSpec]) -> None:
+    conn = open_lance_duckdb(args)
+    try:
+        for spec in specs:
+            conn.execute(f"ALTER TABLE {quote_literal(target_uri)} ADD COLUMN {quote_identifier(spec.name)} {_lance_sql_type(spec)}")
+    finally:
+        conn.close()
+
+
+def create_indexes_for_dataset(dataset: Any, table_name: str, requested_columns: Iterable[IndexSpec | tuple[str, str] | tuple[str, str, str]]) -> tuple[int, list[JsonMap]]:
+    columns = set(_dataset_column_types(dataset))
+    skipped: list[JsonMap] = []
+    created = 0
+    for spec in _index_specs(requested_columns):
+        column = spec.column
+        index_type = _validate_index_type(spec.index_type)
+        if column not in columns:
+            skipped.append({"table": table_name, "column": column, "reason": "missing_column"})
+            continue
+        try:
+            dataset.create_scalar_index(column, index_type, name=spec.name or index_name(table_name, column), replace=False)
+            created += 1
+        except TypeError:
+            try:
+                dataset.create_scalar_index(column, index_type=index_type, name=spec.name or index_name(table_name, column), replace=False)
+                created += 1
+            except TypeError:
+                dataset.create_scalar_index(column, index_type=index_type, name=spec.name or index_name(table_name, column))
+                created += 1
+        except Exception as exc:  # noqa: BLE001
+            if "already" in str(exc).lower():
+                skipped.append({"table": table_name, "column": column, "error": repr(exc), "reason": "already_exists"})
+                continue
+            raise
+    return created, skipped
+
+
+def reconcile_lance_schema(args: argparse.Namespace, table_name: str, target_uri: str, table_schema: JsonMap | None) -> list[ColumnSpec] | None:
     if table_schema is None:
         if args.unknown_table_policy == "fail":
             raise RuntimeError(f"Schema missing for incremental table {table_name}; refusing to merge without Convex schema")
@@ -727,15 +946,18 @@ def reconcile_lance_schema(conn: Any, args: argparse.Namespace, table_name: str,
         dataset = lance.dataset(target_uri)
     except Exception:  # noqa: BLE001
         if args.unknown_table_policy == "fail":
-            raise RuntimeError(f"Lance table missing for {table_name} at {target_uri}; run an initial load before allowing incremental deltas")
+            raise RuntimeError(f"Lance table missing for {table_name} at {target_uri}; run full backfill before allowing incremental deltas")
         if args.unknown_table_policy == "skip":
             log_event("lance_incremental_table_skipped_missing_dataset", table=table_name, target_uri=target_uri)
-            return
+            return []
         import pyarrow as pa
 
         empty = pa.Table.from_pylist([], schema=_arrow_schema_for_specs(specs))
         lance.write_dataset(empty, target_uri, mode="create")
-        generated_indexes, index_skipped = create_indexes_for_columns(conn, table_name, quote_literal(target_uri), generated_index_columns())
+        dataset = lance.dataset(target_uri)
+        requested, config = requested_index_specs(args, table_name)
+        generated_indexes, index_skipped = create_indexes_for_dataset(dataset, table_name, requested)
+        write_applied_table_config_state(table_config_state(args), table_name, config, generated_indexes, index_skipped)
         log_event(
             "lance_incremental_table_created_from_schema",
             table=table_name,
@@ -743,30 +965,62 @@ def reconcile_lance_schema(conn: Any, args: argparse.Namespace, table_name: str,
             columns=len(specs),
             generated_indexes=generated_indexes,
             index_skipped=index_skipped,
+            table_config_version=config.version if config else None,
         )
-        return
-    existing = {field.name: field.type for field in dataset.schema}
-    added: list[str] = []
+        return specs
+    existing = _dataset_column_types(dataset)
+    added: list[ColumnSpec] = []
+    alterations: list[JsonMap] = []
     drift: list[JsonMap] = []
     for spec in specs:
         desired_type = _pa_type_for_column(spec)
         existing_type = existing.get(spec.name)
         if existing_type is not None:
-            if not _schema_types_compatible(existing_type, desired_type):
-                drift.append({"column": spec.name, "existing": str(existing_type), "desired": str(desired_type)})
+            alteration = _schema_type_alteration(existing_type, desired_type)
+            if alteration is None:
+                if not _schema_types_compatible(existing_type, desired_type):
+                    drift.append({"column": spec.name, "existing": str(existing_type), "desired": str(desired_type), "reason": "duckdb_rewrite_required"})
+                continue
+            alterations.append({"path": spec.name, **alteration})
             continue
-        statement = f"ALTER TABLE {quote_literal(target_uri)} ADD COLUMN {quote_identifier(spec.name)} {_lance_sql_type(spec)}"
-        conn.execute(statement)
-        added.append(spec.name)
+        added.append(spec)
     if drift:
         log_event("lance_incremental_schema_type_drift", table=table_name, target_uri=target_uri, drift=drift)
-        raise RuntimeError(f"Lance schema type drift for {table_name}: {drift}")
+        raise RuntimeError(f"Lance schema type drift for {table_name}; run a controlled DuckDB rewrite before incremental merge: {drift}")
+    if alterations:
+        try:
+            dataset.alter_columns(*alterations)
+        except Exception as exc:  # noqa: BLE001
+            logged = [{"path": alteration["path"], "data_type": str(alteration.get("data_type"))} for alteration in alterations]
+            log_event("lance_incremental_schema_alter_failed", table=table_name, target_uri=target_uri, alterations=logged, error=repr(exc))
+            raise
+        log_event("lance_incremental_schema_columns_altered", table=table_name, target_uri=target_uri, columns=[str(alteration["path"]) for alteration in alterations])
     if added:
-        log_event("lance_incremental_schema_columns_added", table=table_name, target_uri=target_uri, columns=added)
+        if not _add_lance_columns_native(dataset, added):
+            log_event("lance_incremental_schema_add_columns_duckdb_fallback", table=table_name, target_uri=target_uri, columns=[spec.name for spec in added])
+            _add_lance_columns_duckdb(args, target_uri, added)
+        log_event("lance_incremental_schema_columns_added", table=table_name, target_uri=target_uri, columns=[spec.name for spec in added])
+    return specs
+
+
+def _status_id_filter_values(ids: Iterable[str]) -> list[str]:
+    return sorted({status_id_value(status, row_id) for row_id in ids for status in (1, 3)})
+
+
+def _lance_in_filter(column: str, values: list[str]) -> str:
+    return f"{column} IN (" + ", ".join(quote_literal(value) for value in values) + ")"
+
+
+def _existing_current_rows_native(dataset: Any, ids: Iterable[str]) -> list[JsonMap]:
+    wanted = _status_id_filter_values(ids)
+    if not wanted:
+        return []
+    table = dataset.to_table(filter=_lance_in_filter("__status_id", wanted))
+    return table.to_pylist()
 
 
 def _existing_current_rows(conn: Any, target_ref: str, ids: Iterable[str]) -> list[JsonMap]:
-    wanted = sorted({status_id_value(status, row_id) for row_id in ids for status in (1, 3)})
+    wanted = _status_id_filter_values(ids)
     if not wanted:
         return []
     values = ", ".join(f"({quote_literal(value)})" for value in wanted)
@@ -775,19 +1029,18 @@ def _existing_current_rows(conn: Any, target_ref: str, ids: Iterable[str]) -> li
     return [dict(zip(column_names, row, strict=False)) for row in result.fetchall()]
 
 
-def merge_incremental_rows(conn: Any, table_name: str, target_uri: str, rows: list[JsonMap]) -> int:
+def merge_incremental_rows(table_name: str, target_uri: str, rows: list[JsonMap], specs: list[ColumnSpec] | None = None) -> int:
     if not rows:
         return 0
-    target_ref = quote_literal(target_uri)
     ids = [str(row["_id"]) for row in rows if row.get("_id") is not None]
-    column_types = _table_column_types(conn, target_ref)
-    existing_current = _existing_current_rows(conn, target_ref, ids)
-    merge_rows = prepare_incremental_merge_rows(rows, existing_current)
-    merge_rows = _coerce_merge_rows_for_schema(merge_rows, column_types)
     import lance
     import pyarrow as pa
 
     dataset = lance.dataset(target_uri)
+    existing_current = _existing_current_rows_native(dataset, ids)
+    merge_rows = prepare_incremental_merge_rows(rows, existing_current)
+    if specs is not None:
+        merge_rows = normalize_rows_for_specs(merge_rows, specs)
     merge_rows = _coerce_rows_for_arrow_schema(merge_rows, dataset.schema)
     merge_table = pa.Table.from_pylist(merge_rows, schema=dataset.schema)
     dataset.merge_insert("__id_ts").when_matched_update_all().when_not_matched_insert_all().execute(merge_table)
@@ -807,7 +1060,6 @@ def run_incremental_once(args: argparse.Namespace) -> JsonMap:
     cursor, cursor_etag = _read_incremental_cursor(state, args)
     schema_payload = incremental_schema_payload(state, args, client) if args.reconcile_schema else {"schemas": {}}
     start_cursor = cursor
-    conn = open_lance_duckdb(args)
     pages = rows_seen = rows_accepted = rows_merged = 0
     table_rows: dict[str, int] = {}
     try:
@@ -832,13 +1084,16 @@ def run_incremental_once(args: argparse.Namespace) -> JsonMap:
             for source_table, table_page_rows in by_table.items():
                 physical = source_to_physical_table(source_table)
                 target_uri = lance_uri(bucket, args.lance_prefix, physical)
-                reconcile_lance_schema(conn, args, physical, target_uri, table_schema_from_payload(schema_payload, source_table))
-                merged = merge_incremental_rows(conn, physical, target_uri, table_page_rows)
+                specs = reconcile_lance_schema(args, physical, target_uri, table_schema_from_payload(schema_payload, source_table))
+                if specs == []:
+                    continue
+                config_result = reconcile_table_config_for_dataset(args, physical, target_uri) if args.table_config_indexes else None
+                merged = merge_incremental_rows(physical, target_uri, table_page_rows, specs)
                 rows_merged += merged
                 page_rows_merged += merged
                 table_rows[source_table] = table_rows.get(source_table, 0) + merged
                 page_table_rows[source_table] = page_table_rows.get(source_table, 0) + merged
-                log_event("lance_incremental_table_merged", table=source_table, physical_table=physical, rows=len(table_page_rows), merge_rows=merged, cursor=page_cursor)
+                log_event("lance_incremental_table_merged", table=source_table, physical_table=physical, rows=len(table_page_rows), merge_rows=merged, cursor=page_cursor, table_config=config_result)
             if page_cursor is not None:
                 verify_lease_owner(state, lease)
                 current_payload, current_etag = state.read_with_etag(args.cursor_key)
@@ -851,9 +1106,6 @@ def run_incremental_once(args: argparse.Namespace) -> JsonMap:
                 cursor_etag = _write_incremental_cursor(state, args, cursor, cursor_etag, {"owner": lease.owner, "pages_processed": pages, "previous_cursor": page_start_cursor})
             heartbeat_lease(state, lease, args.lock_ttl_seconds)
             log_event("lance_incremental_page", page=pages, values=len(raw_rows), accepted=sum(len(v) for v in by_table.values()), cursor=cursor, has_more=has_more)
-            if shutdown_requested():
-                log_event("lance_incremental_shutdown_requested", signal=shutdown_signal(), start_cursor=start_cursor, last_cursor=cursor, pages_completed=pages)
-                break
             if pages >= args.max_pages_per_sync or not has_more:
                 break
         state.delete("incremental/last_error.json")
@@ -863,7 +1115,6 @@ def run_incremental_once(args: argparse.Namespace) -> JsonMap:
         state.write("incremental/last_error.json", {"owner": lease.owner, "error": repr(exc), "start_cursor": start_cursor, "last_cursor": cursor, "updated_at": int(time.time())})
         raise
     finally:
-        conn.close()
         release_lease(state, lease)
 
 
@@ -872,7 +1123,7 @@ def run_incremental_loop(args: argparse.Namespace) -> None:
     pages_since_optimize = 0
     rows_since_optimize = 0
     last_optimized_at = time.time()
-    while not shutdown_requested():
+    while True:
         optimized = False
         try:
             stats = run_incremental_once(args)
@@ -889,11 +1140,8 @@ def run_incremental_loop(args: argparse.Namespace) -> None:
                 optimized = run_idle_maintenance_once(args, _incremental_state(args))
         except LeaseUnavailable as exc:
             log_event("lance_incremental_lock_unavailable", error=str(exc))
-        if shutdown_requested():
-            log_event("lance_incremental_loop_stopped", signal=shutdown_signal())
-            break
         if not optimized:
-            _shutdown_event.wait(args.sleep_seconds)
+            time.sleep(args.sleep_seconds)
 
 
 def maybe_optimize_incremental_indices(args: argparse.Namespace, touched_tables: set[str], pages: int, rows: int, last_optimized_at: float) -> bool:
@@ -921,12 +1169,7 @@ def maybe_optimize_incremental_indices(args: argparse.Namespace, touched_tables:
 
 
 def should_run_idle_maintenance(args: argparse.Namespace, stats: JsonMap) -> bool:
-    return bool(
-        args.idle_maintenance
-        and not shutdown_requested()
-        and int(stats.get("rows_accepted", 0)) <= args.idle_maintenance_max_rows
-        and int(stats.get("pages", 0)) <= args.idle_maintenance_max_pages
-    )
+    return bool(args.idle_maintenance and int(stats.get("rows_accepted", 0)) <= args.idle_maintenance_max_rows and int(stats.get("pages", 0)) <= args.idle_maintenance_max_pages)
 
 
 def maintenance_actions(args: argparse.Namespace) -> list[tuple[str, int]]:
@@ -1002,9 +1245,6 @@ def choose_maintenance_work(args: argparse.Namespace, maintenance_state: JsonMap
 
 
 def run_idle_maintenance_once(args: argparse.Namespace, state: S3JsonState) -> bool:
-    if shutdown_requested():
-        log_event("lance_incremental_idle_maintenance_skipped_shutdown", signal=shutdown_signal())
-        return False
     bucket = env_or_arg(args, "lance_bucket", "LANCE_BUCKET")
     tables = list_lance_tables(argparse.Namespace(tables=args.maintenance_tables, tables_file=args.maintenance_tables_file, lance_bucket=bucket, lance_prefix=args.lance_prefix, aws_region=args.aws_region))
     maintenance_state = read_maintenance_state(state, args)
@@ -1012,20 +1252,25 @@ def run_idle_maintenance_once(args: argparse.Namespace, state: S3JsonState) -> b
     if work is None:
         return False
     action, table = work
-    if shutdown_requested():
-        log_event("lance_incremental_idle_maintenance_skipped_shutdown", signal=shutdown_signal(), action=action, table=table)
-        return False
     target_uri = lance_uri(bucket, args.lance_prefix, table)
     started = time.monotonic()
+    import lance
 
     try:
-        result = run_maintenance_action_with_timeout(args, action, target_uri)
+        dataset = lance.dataset(target_uri)
+        if action == "optimize_indices":
+            result = dataset.optimize.optimize_indices()
+        elif action == "compact_files":
+            result = dataset.optimize.compact_files(materialize_deletions=True, num_threads=args.maintenance_compact_threads)
+        elif action == "cleanup_old_versions":
+            from datetime import timedelta
+
+            result = dataset.cleanup_old_versions(older_than=timedelta(seconds=args.maintenance_cleanup_older_than_seconds), retain_versions=args.maintenance_retain_versions)
+        else:
+            raise ValueError(f"unknown maintenance action: {action}")
         elapsed = round(time.monotonic() - started, 3)
         maintenance_state.setdefault("last_run_by_action", {}).setdefault(action, {})[table] = int(time.time())
-        audit_event = {"status": "completed", "action": action, "table": table, "target_uri": target_uri, "result": result, "elapsed_seconds": elapsed}
-        if shutdown_requested():
-            audit_event["shutdown_requested"] = True
-            audit_event["shutdown_signal"] = shutdown_signal()
+        audit_event = {"status": "completed", "action": action, "table": table, "target_uri": target_uri, "result": repr(result), "elapsed_seconds": elapsed}
         log_event("lance_incremental_idle_maintenance_completed", **audit_event)
         write_maintenance_audit(state, args, audit_event)
     except Exception as exc:  # noqa: BLE001
@@ -1033,69 +1278,11 @@ def run_idle_maintenance_once(args: argparse.Namespace, state: S3JsonState) -> b
         failures = maintenance_state.setdefault("failures", [])
         failures.append({"action": action, "table": table, "error": repr(exc), "updated_at": int(time.time())})
         del failures[:-20]
-        status = "timed_out" if isinstance(exc, TimeoutError) else "failed"
-        audit_event = {"status": status, "action": action, "table": table, "target_uri": target_uri, "error": repr(exc), "elapsed_seconds": elapsed}
-        if shutdown_requested():
-            audit_event["shutdown_requested"] = True
-            audit_event["shutdown_signal"] = shutdown_signal()
+        audit_event = {"status": "failed", "action": action, "table": table, "target_uri": target_uri, "error": repr(exc), "elapsed_seconds": elapsed}
         log_event("lance_incremental_idle_maintenance_failed", **audit_event)
         write_maintenance_audit(state, args, audit_event)
     write_maintenance_state(state, args, maintenance_state)
     return True
-
-
-def run_maintenance_action(args: argparse.Namespace, action: str, target_uri: str) -> str:
-    import lance
-
-    dataset = lance.dataset(target_uri)
-    if action == "optimize_indices":
-        return repr(dataset.optimize.optimize_indices())
-    if action == "compact_files":
-        return repr(dataset.optimize.compact_files(materialize_deletions=True, num_threads=args.maintenance_compact_threads))
-    if action == "cleanup_old_versions":
-        from datetime import timedelta
-
-        return repr(dataset.cleanup_old_versions(older_than=timedelta(seconds=args.maintenance_cleanup_older_than_seconds), retain_versions=args.maintenance_retain_versions))
-    raise ValueError(f"unknown maintenance action: {action}")
-
-
-def _maintenance_action_child(args: argparse.Namespace, action: str, target_uri: str, queue: multiprocessing.Queue) -> None:
-    try:
-        queue.put({"status": "completed", "result": run_maintenance_action(args, action, target_uri)})
-    except BaseException as exc:  # noqa: BLE001
-        queue.put({"status": "failed", "error": repr(exc)})
-
-
-def run_maintenance_action_with_timeout(args: argparse.Namespace, action: str, target_uri: str) -> str:
-    timeout = args.maintenance_action_timeout_seconds
-    if timeout <= 0:
-        return run_maintenance_action(args, action, target_uri)
-    queue: multiprocessing.Queue = multiprocessing.Queue(maxsize=1)
-    process = multiprocessing.Process(target=_maintenance_action_child, args=(args, action, target_uri, queue))
-    started = time.monotonic()
-    process.start()
-    while process.is_alive():
-        process.join(timeout=0.2)
-        if shutdown_requested():
-            process.terminate()
-            process.join(args.maintenance_action_kill_grace_seconds)
-            if process.is_alive():
-                process.kill()
-                process.join()
-            raise RuntimeError(f"maintenance action interrupted by {shutdown_signal()}: {action} {target_uri}")
-        if time.monotonic() - started >= timeout:
-            process.terminate()
-            process.join(args.maintenance_action_kill_grace_seconds)
-            if process.is_alive():
-                process.kill()
-                process.join()
-            raise TimeoutError(f"maintenance action timed out after {timeout}s: {action} {target_uri}")
-    if process.exitcode != 0 and queue.empty():
-        raise RuntimeError(f"maintenance action process exited with {process.exitcode}: {action} {target_uri}")
-    message = queue.get() if not queue.empty() else {"status": "failed", "error": f"missing child result exitcode={process.exitcode}"}
-    if message.get("status") != "completed":
-        raise RuntimeError(str(message.get("error")))
-    return str(message.get("result"))
 
 
 def list_lance_tables(args: argparse.Namespace) -> list[str]:
@@ -1132,23 +1319,231 @@ def table_columns(conn: Any, table_ref: str) -> set[str]:
     return set(table_column_names(conn, table_ref))
 
 
+LANCE_SCALAR_INDEX_ENV = {
+    "LANCE_BYPASS_SPILLING": "true",
+}
+
+DEFAULT_LANCE_TABLE_CONFIG_STATE_PREFIX = "lance-incremental/table-config-state"
+
+
 def index_name(table_name: str, column: str) -> str:
     return source_to_physical_table(f"{table_name}_{column}_idx")
 
 
-def generated_index_columns() -> list[tuple[str, str]]:
-    return [("__id_ts", "BTREE"), ("__status_id", "BTREE"), ("__status", "BITMAP")]
+def generated_index_columns() -> list[IndexSpec]:
+    return [IndexSpec("__id_ts", "BTREE"), IndexSpec("__status_id", "BTREE"), IndexSpec("__status", "BITMAP")]
 
 
-def create_indexes_for_columns(conn: Any, table_name: str, table_ref: str, requested_columns: list[tuple[str, str]]) -> tuple[int, list[JsonMap]]:
+def _index_specs(values: Iterable[IndexSpec | tuple[str, str] | tuple[str, str, str]]) -> list[IndexSpec]:
+    specs: list[IndexSpec] = []
+    for value in values:
+        if isinstance(value, IndexSpec):
+            specs.append(value)
+        elif len(value) == 2:
+            column, index_type = value
+            specs.append(IndexSpec(str(column), str(index_type)))
+        else:
+            column, index_type, name = value
+            specs.append(IndexSpec(str(column), str(index_type), str(name)))
+    return specs
+
+
+def _validate_index_type(index_type: str) -> str:
+    normalized = index_type.upper()
+    if normalized not in {"BTREE", "BITMAP", "LABEL_LIST"}:
+        raise ValueError(f"Unsupported Lance scalar index type: {index_type}")
+    return normalized
+
+
+def _table_config_name(table_name: str) -> str:
+    return f"{source_to_physical_table(table_name)}.toml"
+
+
+def _parse_table_config_toml(table_name: str, payload: bytes, version: str) -> TableConfig:
+    import tomllib
+
+    parsed = tomllib.loads(payload.decode("utf-8"))
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Lance table config for {table_name} must be a TOML object")
+    raw_indexes = parsed.get("indexes", [])
+    if not isinstance(raw_indexes, list):
+        raise ValueError(f"Lance table config for {table_name} indexes must be an array of tables")
+    indexes: list[IndexSpec] = []
+    for raw in raw_indexes:
+        if not isinstance(raw, dict):
+            raise ValueError(f"Lance table config for {table_name} index entries must be tables")
+        column = raw.get("column")
+        if not isinstance(column, str) or not column:
+            raise ValueError(f"Lance table config for {table_name} index entries require column")
+        raw_type = raw.get("type", raw.get("index_type", "BTREE"))
+        if not isinstance(raw_type, str) or not raw_type:
+            raise ValueError(f"Lance table config for {table_name} index {column} requires string type")
+        raw_name = raw.get("name")
+        if raw_name is not None and (not isinstance(raw_name, str) or not raw_name):
+            raise ValueError(f"Lance table config for {table_name} index {column} name must be a non-empty string")
+        indexes.append(IndexSpec(column, _validate_index_type(raw_type), raw_name))
+    return TableConfig(table_name=source_to_physical_table(table_name), version=version, indexes=indexes)
+
+
+def _read_local_table_config(table_name: str, config_dir: str) -> TableConfig | None:
+    path = Path(config_dir) / _table_config_name(table_name)
+    if not path.exists():
+        return None
+    payload = path.read_bytes()
+    return _parse_table_config_toml(table_name, payload, f"sha256:{hashlib.sha256(payload).hexdigest()}")
+
+
+def _read_s3_table_config(table_name: str, bucket: str, prefix: str, region: str | None) -> TableConfig | None:
+    from botocore.exceptions import ClientError
+    import boto3
+
+    key_prefix = prefix.strip("/")
+    key = f"{key_prefix}/{_table_config_name(table_name)}" if key_prefix else _table_config_name(table_name)
+    try:
+        obj = boto3.client("s3", region_name=region).get_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in {"NoSuchKey", "404"}:
+            return None
+        raise
+    payload = obj["Body"].read()
+    etag = str(obj.get("ETag") or "").strip('"')
+    version = f"etag:{etag}" if etag else f"sha256:{hashlib.sha256(payload).hexdigest()}"
+    return _parse_table_config_toml(table_name, payload, version)
+
+
+def load_table_config(args: argparse.Namespace, table_name: str) -> TableConfig | None:
+    local_dir = getattr(args, "table_config_dir", None) or os.environ.get("LANCE_TABLE_CONFIG_DIR")
+    if local_dir:
+        config = _read_local_table_config(table_name, local_dir)
+        if config is not None:
+            return config
+    bucket = getattr(args, "table_config_bucket", None) or os.environ.get("LANCE_TABLE_CONFIG_BUCKET")
+    prefix = getattr(args, "table_config_prefix", None) or os.environ.get("LANCE_TABLE_CONFIG_PREFIX", "config/lance/tables")
+    if bucket:
+        return _read_s3_table_config(table_name, bucket, prefix, getattr(args, "aws_region", None))
+    return None
+
+
+def requested_index_specs(args: argparse.Namespace, table_name: str) -> tuple[list[IndexSpec], TableConfig | None]:
+    requested: list[IndexSpec] = []
+    if getattr(args, "generated_indexes", True):
+        requested.extend(generated_index_columns())
+    config = load_table_config(args, table_name) if getattr(args, "table_config_indexes", True) else None
+    if config is not None:
+        requested.extend(config.indexes)
+    deduped: list[IndexSpec] = []
+    seen: set[tuple[str, str, str | None]] = set()
+    for spec in requested:
+        key = (spec.column, _validate_index_type(spec.index_type), spec.name)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(IndexSpec(spec.column, key[1], spec.name))
+    return deduped, config
+
+
+def desired_index_names(table_name: str, specs: Iterable[IndexSpec]) -> set[str]:
+    return {spec.name or index_name(table_name, spec.column) for spec in specs}
+
+
+def dataset_index_names(dataset: Any) -> set[str]:
+    list_indices = getattr(dataset, "list_indices", None)
+    if list_indices is None:
+        return set()
+    names: set[str] = set()
+    for item in list_indices() or []:
+        if isinstance(item, str):
+            names.add(item)
+            continue
+        if isinstance(item, dict):
+            raw_name = item.get("name")
+        else:
+            raw_name = getattr(item, "name", None)
+        if raw_name:
+            names.add(str(raw_name))
+    return names
+
+
+def log_extra_lance_indexes(table_name: str, target_uri: str, dataset: Any, desired_names: set[str]) -> list[str]:
+    extra = sorted(dataset_index_names(dataset) - desired_names)
+    if extra:
+        log_event("lance_table_config_extra_indexes_detected", table=table_name, target_uri=target_uri, extra_indexes=extra, action="would_drop_if_subtractive")
+    return extra
+
+
+def table_config_state(args: argparse.Namespace) -> S3JsonState | None:
+    bucket = (
+        getattr(args, "table_config_state_bucket", None)
+        or os.environ.get("LANCE_TABLE_CONFIG_STATE_BUCKET")
+        or getattr(args, "state_bucket", None)
+        or os.environ.get("LANCE_INCREMENTAL_STATE_BUCKET")
+        or os.environ.get("S3TABLES_BACKFILL_STATE_BUCKET")
+    )
+    if not bucket:
+        return None
+    prefix = getattr(args, "table_config_state_prefix", None) or os.environ.get("LANCE_TABLE_CONFIG_STATE_PREFIX") or DEFAULT_LANCE_TABLE_CONFIG_STATE_PREFIX
+    return S3JsonState(bucket, prefix)
+
+
+def table_config_state_key(table_name: str) -> str:
+    return f"{source_to_physical_table(table_name)}.json"
+
+
+def read_applied_table_config_version(state: S3JsonState | None, table_name: str) -> str | None:
+    if state is None:
+        return None
+    payload = state.read(table_config_state_key(table_name))
+    return str(payload.get("config_version")) if payload and payload.get("config_version") is not None else None
+
+
+def write_applied_table_config_state(state: S3JsonState | None, table_name: str, config: TableConfig | None, created: int, skipped: list[JsonMap]) -> None:
+    if state is None or config is None:
+        return
+    if any(item.get("reason") != "already_exists" for item in skipped):
+        return
+    state.write(
+        table_config_state_key(table_name),
+        {
+            "table": source_to_physical_table(table_name),
+            "config_version": config.version,
+            "applied_at": int(time.time()),
+            "indexes": [{"column": index.column, "type": index.index_type, **({"name": index.name} if index.name else {})} for index in config.indexes],
+            "created_indexes": created,
+            "skipped_indexes": skipped,
+        },
+    )
+
+
+def reconcile_table_config_for_dataset(args: argparse.Namespace, table_name: str, target_uri: str, force: bool = False) -> JsonMap:
+    config = load_table_config(args, table_name)
+    if config is None:
+        return {"configured": False, "created": 0, "skipped": [], "version": None}
+    requested, _config = requested_index_specs(args, table_name)
+    desired_names = desired_index_names(table_name, requested)
+    state = table_config_state(args)
+    import lance
+
+    dataset = lance.dataset(target_uri)
+    extra_indexes = log_extra_lance_indexes(table_name, target_uri, dataset, desired_names)
+    if not force and read_applied_table_config_version(state, table_name) == config.version:
+        return {"configured": True, "created": 0, "skipped": [], "version": config.version, "already_applied": True, "extra_indexes": extra_indexes}
+
+    created, skipped = create_indexes_for_dataset(dataset, table_name, config.indexes)
+    write_applied_table_config_state(state, table_name, config, created, skipped)
+    return {"configured": True, "created": created, "skipped": skipped, "version": config.version, "already_applied": False, "extra_indexes": extra_indexes}
+
+
+def create_indexes_for_columns(conn: Any, table_name: str, table_ref: str, requested_columns: Iterable[IndexSpec | tuple[str, str] | tuple[str, str, str]]) -> tuple[int, list[JsonMap]]:
     columns = table_columns(conn, table_ref)
     skipped: list[JsonMap] = []
     created = 0
-    for column, index_type in requested_columns:
+    for spec in _index_specs(requested_columns):
+        column = spec.column
+        index_type = _validate_index_type(spec.index_type)
         if column not in columns:
             skipped.append({"table": table_name, "column": column, "reason": "missing_column"})
             continue
-        statement = f"CREATE INDEX {index_name(table_name, column)} ON {table_ref} ({column}) USING {index_type}"
+        statement = f"CREATE INDEX {spec.name or index_name(table_name, column)} ON {table_ref} ({quote_identifier(column)}) USING {index_type}"
         try:
             conn.execute(statement)
             created += 1
@@ -1159,70 +1554,1199 @@ def create_indexes_for_columns(conn: Any, table_name: str, table_ref: str, reque
             raise
     return created, skipped
 
-def add_incremental_arguments(parser: argparse.ArgumentParser, *, loop: bool) -> None:
-    parser.add_argument("--convex-url")
-    parser.add_argument("--convex-deploy-key")
-    parser.add_argument("--state-bucket")
-    parser.add_argument("--state-prefix")
-    parser.add_argument("--cursor-key", default=os.environ.get("LANCE_INCREMENTAL_CURSOR_KEY", "incremental/cursor.json"))
-    parser.add_argument("--schema-key", default=os.environ.get("LANCE_INCREMENTAL_SCHEMA_KEY", "incremental/schema.json"))
-    parser.add_argument("--schema-refresh-seconds", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_SCHEMA_REFRESH_SECONDS", "600")))
-    parser.add_argument("--reconcile-schema", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_INCREMENTAL_RECONCILE_SCHEMA", "true").lower() not in {"0", "false", "no"})
-    parser.add_argument("--unknown-table-policy", choices=["fail", "create", "skip"], default=os.environ.get("LANCE_INCREMENTAL_UNKNOWN_TABLE_POLICY", "fail"))
-    parser.add_argument("--lance-bucket")
-    parser.add_argument("--lance-prefix", default=os.environ.get("LANCE_PREFIX", "tables"))
-    parser.add_argument("--lance-root-uri")
-    parser.add_argument("--lance-scope")
-    parser.add_argument("--catalog-alias")
-    parser.add_argument("--max-pages-per-sync", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_MAX_PAGES_PER_SYNC", "100")))
-    if loop:
-        parser.add_argument("--sleep-seconds", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_SLEEP_SECONDS", "20")))
-        parser.add_argument("--optimize-touched-indices", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_INCREMENTAL_OPTIMIZE_TOUCHED_INDICES", "true").lower() not in {"0", "false", "no"})
-        parser.add_argument("--optimize-indices-pages", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_OPTIMIZE_INDICES_PAGES", "50")))
-        parser.add_argument("--optimize-indices-rows", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_OPTIMIZE_INDICES_ROWS", "5000")))
-        parser.add_argument("--optimize-indices-seconds", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_OPTIMIZE_INDICES_SECONDS", "900")))
-        parser.add_argument("--idle-maintenance", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_INCREMENTAL_IDLE_MAINTENANCE", "true").lower() not in {"0", "false", "no"})
-        parser.add_argument("--idle-maintenance-max-rows", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_IDLE_MAINTENANCE_MAX_ROWS", "0")))
-        parser.add_argument("--idle-maintenance-max-pages", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_IDLE_MAINTENANCE_MAX_PAGES", "1")))
-        parser.add_argument("--maintenance-state-key", default=os.environ.get("LANCE_INCREMENTAL_MAINTENANCE_STATE_KEY", "incremental/maintenance_state.json"))
-        parser.add_argument("--maintenance-audit-key-prefix", default=os.environ.get("LANCE_INCREMENTAL_MAINTENANCE_AUDIT_KEY_PREFIX", "incremental/maintenance-audit"))
-        parser.add_argument("--maintenance-tables")
-        parser.add_argument("--maintenance-tables-file")
-        parser.add_argument("--maintenance-optimize-indices-seconds", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_OPTIMIZE_INDICES_SECONDS", "3600")))
-        parser.add_argument("--maintenance-compact-files-seconds", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_COMPACT_FILES_SECONDS", "86400")))
-        parser.add_argument("--maintenance-cleanup-old-versions-seconds", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_CLEANUP_OLD_VERSIONS_SECONDS", "604800")))
-        parser.add_argument("--maintenance-cleanup-older-than-seconds", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_CLEANUP_OLDER_THAN_SECONDS", "259200")))
-        parser.add_argument("--maintenance-retain-versions", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_RETAIN_VERSIONS", "500")))
-        parser.add_argument("--maintenance-compact-threads", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_COMPACT_THREADS", "1")))
-        parser.add_argument("--maintenance-action-timeout-seconds", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_ACTION_TIMEOUT_SECONDS", "90")))
-        parser.add_argument("--maintenance-action-kill-grace-seconds", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_ACTION_KILL_GRACE_SECONDS", "10")))
-        parser.add_argument("--maintenance-heavy-window-start-utc", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_HEAVY_WINDOW_START_UTC", "7")))
-        parser.add_argument("--maintenance-heavy-window-end-utc", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_HEAVY_WINDOW_END_UTC", "12")))
-    parser.add_argument("--lock-ttl-seconds", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_LOCK_TTL_SECONDS", "300")))
-    parser.add_argument("--force", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--duckdb-path", default=os.environ.get("LANCE_INCREMENTAL_DUCKDB_PATH", "/tmp/lance-incremental.duckdb"))
-    parser.add_argument("--threads", type=int, default=int(os.environ.get("DUCKDB_THREADS", "0")) or None)
-    parser.add_argument("--memory-limit", default=os.environ.get("DUCKDB_MEMORY_LIMIT"))
-    parser.add_argument("--temp-directory", default=os.environ.get("DUCKDB_TEMP_DIRECTORY"))
-    parser.add_argument("--aws-region")
+
+def run_create_lance_indexes(args: argparse.Namespace) -> None:
+    args.aws_region = args.aws_region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    bucket = args.lance_bucket or os.environ.get("LANCE_BUCKET")
+    if not args.lance_root_uri:
+        if not bucket:
+            raise SystemExit("--lance-root-uri, --lance-bucket, or LANCE_BUCKET is required")
+        args.lance_root_uri = f"s3://{bucket}/{normalize_prefix(args.lance_prefix)}"
+    args.lance_scope = args.lance_scope or (f"s3://{bucket}/" if bucket else args.lance_root_uri)
+    tables = list_lance_tables(args)
+    if args.max_tables is not None:
+        tables = tables[: args.max_tables]
+    if not tables:
+        raise SystemExit("No Lance tables found")
+
+    log_event("lance_index_creation_started", tables=len(tables), lance_root_uri=args.lance_root_uri, dry_run=args.dry_run)
+    conn = open_lance_duckdb(args)
+    completed = 0
+    failures: list[JsonMap] = []
+    skipped: list[JsonMap] = []
+    try:
+        for table_name in tables:
+            dataset_uri = f"{args.lance_root_uri.rstrip('/')}/{table_name}.lance"
+            table_ref = quote_literal(dataset_uri)
+            try:
+                requested_columns, config = requested_index_specs(args, table_name)
+                if args.dry_run:
+                    for spec in requested_columns:
+                        print(f"CREATE INDEX {spec.name or index_name(table_name, spec.column)} ON {table_ref} ({quote_identifier(spec.column)}) USING {_validate_index_type(spec.index_type)};")
+                    indexes = len(requested_columns)
+                else:
+                    indexes, table_skipped = create_indexes_for_columns(conn, table_name, table_ref, requested_columns)
+                    skipped.extend(table_skipped)
+                    write_applied_table_config_state(table_config_state(args), table_name, config, indexes, table_skipped)
+                completed += 1
+                log_event("lance_index_creation_table_completed", table=table_name, indexes=indexes, table_config_version=config.version if config else None)
+            except Exception as exc:  # noqa: BLE001
+                failure = {"table": table_name, "error": repr(exc)}
+                failures.append(failure)
+                log_event("lance_index_creation_table_failed", **failure)
+                if args.stop_on_failure:
+                    break
+    finally:
+        conn.close()
+    log_event("lance_index_creation_finished", completed=completed, failed=len(failures), skipped=len(skipped))
+    if skipped:
+        print(json.dumps({"skipped": skipped}, indent=2, sort_keys=True), file=sys.stderr)
+    if failures:
+        print(json.dumps({"failures": failures}, indent=2, sort_keys=True), file=sys.stderr)
+        raise SystemExit(1)
+
+
+def run_backfill_generated_columns(args: argparse.Namespace) -> None:
+    args.aws_region = args.aws_region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    bucket = args.lance_bucket or os.environ.get("LANCE_BUCKET")
+    if not args.lance_root_uri:
+        if not bucket:
+            raise SystemExit("--lance-root-uri, --lance-bucket, or LANCE_BUCKET is required")
+        args.lance_root_uri = f"s3://{bucket}/{normalize_prefix(args.lance_prefix)}"
+    args.lance_scope = args.lance_scope or (f"s3://{bucket}/" if bucket else args.lance_root_uri)
+    args.catalog_alias = args.catalog_alias or os.environ.get("LANCE_CATALOG_ALIAS", "lance_ns")
+    tables = list_lance_tables(args)
+    if args.max_tables is not None:
+        tables = tables[: args.max_tables]
+    if not tables:
+        raise SystemExit("No Lance tables found")
+
+    log_event("lance_generated_backfill_started", tables=len(tables), lance_root_uri=args.lance_root_uri, dry_run=args.dry_run)
+    conn = open_lance_duckdb(args)
+    completed = 0
+    failures: list[JsonMap] = []
+    try:
+        for table_name in tables:
+            dataset_uri = f"{args.lance_root_uri.rstrip('/')}/{table_name}.lance"
+            table_ref = quote_literal(dataset_uri)
+            try:
+                columns = table_columns(conn, table_ref)
+                missing_required = {"_id", "_ts", "_current"} - columns
+                if missing_required:
+                    log_event("lance_generated_backfill_skipped", table=table_name, reason="missing_required_columns", columns=sorted(missing_required))
+                    continue
+                statements: list[str] = []
+                base_columns = [column for column in columns if column not in GENERATED_COLUMNS]
+                select_list = ", ".join(quote_identifier(column) for column in base_columns)
+                temp_table = quote_identifier(f"generated_backfill_{table_name}")
+                statements.append(
+                    f"CREATE OR REPLACE TEMP TABLE {temp_table} AS SELECT "
+                    f"{select_list}, "
+                    f"{status_expr()} AS __status, "
+                    f"{status_id_expr()} AS __status_id, "
+                    f"{id_ts_expr()} AS __id_ts "
+                    f"FROM {table_ref}"
+                )
+                statements.append(f"COPY {temp_table} TO {table_ref} (FORMAT lance, mode 'overwrite')")
+                if args.create_indexes:
+                    statements.extend(
+                        [
+                            f"CREATE INDEX {source_to_physical_table(f'{table_name}__id_ts_idx')} ON {quote_literal(dataset_uri)} (__id_ts) USING BTREE",
+                            f"CREATE INDEX {source_to_physical_table(f'{table_name}__status_id_idx')} ON {quote_literal(dataset_uri)} (__status_id) USING BTREE",
+                            f"CREATE INDEX {source_to_physical_table(f'{table_name}__status_idx')} ON {quote_literal(dataset_uri)} (__status) USING BITMAP",
+                        ]
+                    )
+                if args.dry_run:
+                    for statement in statements:
+                        print(statement + ";")
+                else:
+                    for statement in statements:
+                        conn.execute(statement)
+                completed += 1
+                log_event("lance_generated_backfill_table_completed", table=table_name, statements=len(statements))
+            except Exception as exc:  # noqa: BLE001
+                failure = {"table": table_name, "error": repr(exc)}
+                failures.append(failure)
+                log_event("lance_generated_backfill_table_failed", **failure)
+                if args.stop_on_failure:
+                    break
+    finally:
+        conn.close()
+    log_event("lance_generated_backfill_finished", completed=completed, failed=len(failures))
+    if failures:
+        print(json.dumps({"failures": failures}, indent=2, sort_keys=True), file=sys.stderr)
+        raise SystemExit(1)
+
+
+def run_drop_legacy_current(args: argparse.Namespace) -> None:
+    args.aws_region = args.aws_region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    bucket = args.lance_bucket or os.environ.get("LANCE_BUCKET")
+    if not args.lance_root_uri:
+        if not bucket:
+            raise SystemExit("--lance-root-uri, --lance-bucket, or LANCE_BUCKET is required")
+        args.lance_root_uri = f"s3://{bucket}/{normalize_prefix(args.lance_prefix)}"
+    args.lance_scope = args.lance_scope or (f"s3://{bucket}/" if bucket else args.lance_root_uri)
+    args.catalog_alias = args.catalog_alias or os.environ.get("LANCE_CATALOG_ALIAS", "lance_ns")
+    tables = list_lance_tables(args)
+    if args.max_tables is not None:
+        tables = tables[: args.max_tables]
+    if not tables:
+        raise SystemExit("No Lance tables found")
+
+    log_event("lance_drop_legacy_current_started", tables=len(tables), lance_root_uri=args.lance_root_uri, dry_run=args.dry_run)
+    conn = open_lance_duckdb(args)
+    completed = 0
+    failures: list[JsonMap] = []
+    try:
+        for table_name in tables:
+            dataset_uri = f"{args.lance_root_uri.rstrip('/')}/{table_name}.lance"
+            table_ref = quote_literal(dataset_uri)
+            try:
+                columns = table_columns(conn, table_ref)
+                if "_current" not in columns:
+                    log_event("lance_drop_legacy_current_skipped", table=table_name, reason="missing_column")
+                    continue
+                if {"__status", "__status_id", "__id_ts"} - columns:
+                    missing = sorted({"__status", "__status_id", "__id_ts"} - columns)
+                    raise RuntimeError(f"refusing to drop _current before generated columns exist: {missing}")
+                kept_columns = [column for column in columns if column != "_current"]
+                select_list = ", ".join(quote_identifier(column) for column in kept_columns)
+                temp_table = quote_identifier(f"drop_current_{table_name}")
+                statements = [
+                    f"CREATE OR REPLACE TEMP TABLE {temp_table} AS SELECT {select_list} FROM {table_ref}",
+                    f"COPY {temp_table} TO {table_ref} (FORMAT lance, mode 'overwrite')",
+                ]
+                if args.dry_run:
+                    for statement in statements:
+                        print(statement + ";")
+                else:
+                    for statement in statements:
+                        conn.execute(statement)
+                completed += 1
+                log_event("lance_drop_legacy_current_table_completed", table=table_name)
+            except Exception as exc:  # noqa: BLE001
+                failure = {"table": table_name, "error": repr(exc)}
+                failures.append(failure)
+                log_event("lance_drop_legacy_current_table_failed", **failure)
+                if args.stop_on_failure:
+                    break
+    finally:
+        conn.close()
+    log_event("lance_drop_legacy_current_finished", completed=completed, failed=len(failures))
+    if failures:
+        print(json.dumps({"failures": failures}, indent=2, sort_keys=True), file=sys.stderr)
+        raise SystemExit(1)
+
+
+def decode_json_string_literal(value: Any) -> Any:
+    if not isinstance(value, str) or len(value) < 2 or value[0] != '"' or value[-1] != '"':
+        return value
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return value
+    return decoded if isinstance(decoded, str) else value
+
+
+def quoted_json_string_condition(column: str) -> str:
+    ident = quote_identifier(column)
+    value = f"CAST({ident} AS VARCHAR)"
+    parsed = f"CAST({value} AS JSON)"
+    return f"json_valid({value}) AND json_type({parsed}) = 'VARCHAR'"
+
+
+def repair_quoted_json_string_expr(column: str) -> str:
+    ident = quote_identifier(column)
+    value = f"CAST({ident} AS VARCHAR)"
+    parsed = f"CAST({value} AS JSON)"
+    return f"CASE WHEN {quoted_json_string_condition(column)} THEN json_extract_string({parsed}, '$') ELSE {ident} END"
+
+
+def build_repair_quoted_json_strings_select_sql(conn: Any, table_ref: str, repair_columns: set[str]) -> str:
+    columns = table_column_names(conn, table_ref)
+    select_list = []
+    for column in columns:
+        if column in repair_columns:
+            select_list.append(f"{repair_quoted_json_string_expr(column)} AS {quote_identifier(column)}")
+        else:
+            select_list.append(quote_identifier(column))
+    return f"SELECT {', '.join(select_list)} FROM {table_ref}"
+
+
+def count_quoted_json_string_values(conn: Any, table_ref: str, columns: list[str], limit: int | None = None) -> tuple[int, int]:
+    predicates = [quoted_json_string_condition(column) for column in columns]
+    select_list = ", ".join(quote_identifier(column) for column in columns)
+    source = f"SELECT {select_list} FROM {table_ref}"
+    if limit is not None:
+        source += f" LIMIT {int(limit)}"
+    checked = conn.execute(f"SELECT count(*) FROM ({source})").fetchone()[0] * len(columns)
+    repaired = conn.execute(f"SELECT {sum_expr(predicates)} FROM ({source})").fetchone()[0] or 0
+    return int(checked), int(repaired)
+
+
+def sum_expr(predicates: list[str]) -> str:
+    return " + ".join(f"sum(CASE WHEN {predicate} THEN 1 ELSE 0 END)" for predicate in predicates) if predicates else "0"
+
+
+def _bytes_map_to_strings(value: dict[bytes, bytes] | None) -> dict[str, str]:
+    if not value:
+        return {}
+    return {key.decode("utf-8", errors="replace"): item.decode("utf-8", errors="replace") for key, item in sorted(value.items())}
+
+
+def arrow_schema_signature(schema: Any) -> JsonMap:
+    return {
+        "metadata": _bytes_map_to_strings(schema.metadata),
+        "fields": [
+            {
+                "name": field.name,
+                "type": str(field.type),
+                "nullable": bool(field.nullable),
+                "metadata": _bytes_map_to_strings(field.metadata),
+            }
+            for field in schema
+        ],
+    }
+
+
+def validate_repair_columns(dataset: Any, requested_columns: list[str], fail_on_missing: bool) -> tuple[list[str], list[str]]:
+    import pyarrow.types as pat
+
+    fields = {field.name: field for field in dataset.schema}
+    missing = sorted(set(requested_columns) - set(fields))
+    if missing and fail_on_missing:
+        raise RuntimeError(f"repair columns missing from Lance dataset: {missing}")
+    columns = [column for column in requested_columns if column in fields]
+    non_string = [column for column in columns if not (pat.is_string(fields[column].type) or pat.is_large_string(fields[column].type))]
+    if non_string:
+        raise RuntimeError(f"repair-quoted-json-strings only supports string columns, got non-string columns: {non_string}")
+    return columns, missing
+
+
+def restore_lance_version(dataset_uri: str, version: int) -> None:
+    import lance
+
+    lance.dataset(dataset_uri).checkout_version(version).restore()
+
+
+def repair_index_columns(args: argparse.Namespace, table_name: str) -> list[IndexSpec]:
+    requested, _config = requested_index_specs(args, table_name)
+    return requested
+
+
+REPAIR_EXCLUDED_SCHEMA_COLUMNS = {
+    "_id",
+    "_creationTime",
+    "_table",
+    "_ts",
+    "_deleted",
+    "_convex_cursor",
+    "__status",
+    "__status_id",
+    "__id_ts",
+}
+
+
+def desired_repair_columns_from_schema(table_schema: JsonMap) -> list[str]:
+    return [spec.name for spec in schema_column_specs(table_schema) if spec.kind == "string" and spec.name not in REPAIR_EXCLUDED_SCHEMA_COLUMNS]
+
+
+def physical_to_source_schema_map(schema_payload: JsonMap) -> dict[str, tuple[str, JsonMap]]:
+    schemas = schema_payload.get("schemas", schema_payload)
+    if not isinstance(schemas, dict):
+        return {}
+    return {
+        source_to_physical_table(source_table): (source_table, table_schema)
+        for source_table, table_schema in schemas.items()
+        if isinstance(source_table, str) and isinstance(table_schema, dict)
+    }
+
+
+def load_schema_payload(args: argparse.Namespace) -> JsonMap:
+    if args.schema_json:
+        with open(args.schema_json, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if not isinstance(payload, dict):
+            raise SystemExit("--schema-json must contain a JSON object")
+        return payload
+    return _convex_client(args).json_schemas(delta_schema=True)
+
+
+def _duckdb_string_columns(conn: Any, table_ref: str) -> set[str]:
+    rows = conn.execute(f"DESCRIBE {table_ref}").fetchall()
+    return {str(row[0]) for row in rows if "VARCHAR" in str(row[1]).upper() or str(row[1]).upper() == "STRING"}
+
+
+def run_discover_quoted_json_string_repairs(args: argparse.Namespace) -> None:
+    args.aws_region = args.aws_region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    bucket = args.lance_bucket or os.environ.get("LANCE_BUCKET")
+    if not args.lance_root_uri:
+        if not bucket:
+            raise SystemExit("--lance-root-uri, --lance-bucket, or LANCE_BUCKET is required")
+        args.lance_root_uri = f"s3://{bucket}/{normalize_prefix(args.lance_prefix)}"
+    args.lance_scope = args.lance_scope or (f"s3://{bucket}/" if bucket else args.lance_root_uri)
+    schema_by_physical = physical_to_source_schema_map(load_schema_payload(args))
+    tables = list_lance_tables(args)
+    if args.max_tables is not None:
+        tables = tables[: args.max_tables]
+
+    log_event("lance_discover_quoted_json_string_repairs_started", tables=len(tables), lance_root_uri=args.lance_root_uri)
+    candidates: list[JsonMap] = []
+    skipped: list[JsonMap] = []
+    failures: list[JsonMap] = []
+    conn = open_lance_duckdb(args)
+    try:
+        for table_name in tables:
+            schema_entry = schema_by_physical.get(table_name)
+            if schema_entry is None:
+                skipped.append({"table": table_name, "reason": "missing_convex_schema"})
+                continue
+            source_table, table_schema = schema_entry
+            desired_columns = desired_repair_columns_from_schema(table_schema)
+            if not desired_columns:
+                skipped.append({"table": table_name, "source_table": source_table, "reason": "no_desired_string_columns"})
+                continue
+            table_ref = quote_literal(f"{args.lance_root_uri.rstrip('/')}/{table_name}.lance")
+            try:
+                actual_string_columns = _duckdb_string_columns(conn, table_ref)
+                columns = [column for column in desired_columns if column in actual_string_columns]
+                missing = sorted(set(desired_columns) - actual_string_columns)
+                if not columns:
+                    skipped.append({"table": table_name, "source_table": source_table, "reason": "no_matching_string_columns", "missing_or_non_string": missing})
+                    continue
+                for column in columns:
+                    checked, repaired = count_quoted_json_string_values(conn, table_ref, [column], args.limit)
+                    if repaired:
+                        candidates.append(
+                            {
+                                "table": table_name,
+                                "source_table": source_table,
+                                "column": column,
+                                "checked": checked,
+                                "would_repair": repaired,
+                                "sampled": args.limit is not None,
+                                "sample_limit": args.limit,
+                            }
+                        )
+            except Exception as exc:  # noqa: BLE001
+                failures.append({"table": table_name, "source_table": source_table, "error": repr(exc)})
+                if args.stop_on_failure:
+                    break
+    finally:
+        conn.close()
+    log_event("lance_discover_quoted_json_string_repairs_finished", candidates=len(candidates), skipped=len(skipped), failed=len(failures))
+    print(json.dumps({"candidates": candidates, "skipped": skipped if args.include_skipped else [], "failures": failures}, indent=2, sort_keys=True))
+    if failures:
+        raise SystemExit(1)
+
+
+def run_repair_quoted_json_strings(args: argparse.Namespace) -> None:
+    args.aws_region = args.aws_region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    bucket = args.lance_bucket or os.environ.get("LANCE_BUCKET")
+    if not args.lance_root_uri:
+        if not bucket:
+            raise SystemExit("--lance-root-uri, --lance-bucket, or LANCE_BUCKET is required")
+        args.lance_root_uri = f"s3://{bucket}/{normalize_prefix(args.lance_prefix)}"
+    args.lance_scope = args.lance_scope or (f"s3://{bucket}/" if bucket else args.lance_root_uri)
+    tables = list_lance_tables(args)
+    if args.max_tables is not None:
+        tables = tables[: args.max_tables]
+
+    lease: TableLease | None = None
+    state: S3JsonState | None = None
+    if args.apply and args.use_lock:
+        state = _incremental_state(args)
+        lease = acquire_lease(state, "incremental", args.lock_ttl_seconds, args.force)
+
+    import lance
+
+    log_event("lance_repair_quoted_json_strings_started", tables=len(tables), lance_root_uri=args.lance_root_uri, apply=args.apply)
+    report: list[JsonMap] = []
+    failures: list[JsonMap] = []
+    completed = 0
+    conn = None
+    try:
+        conn = open_lance_duckdb(args)
+        for table_name in tables:
+            dataset_uri = f"{args.lance_root_uri.rstrip('/')}/{table_name}.lance"
+            table_ref = quote_literal(dataset_uri)
+            requested_columns = [column.strip() for column in args.columns.split(",") if column.strip()]
+            try:
+                if state is not None and lease is not None:
+                    heartbeat_lease(state, lease, args.lock_ttl_seconds)
+                dataset = lance.dataset(dataset_uri)
+                old_version = int(dataset.version)
+                before_schema = arrow_schema_signature(dataset.schema)
+                columns, missing = validate_repair_columns(dataset, requested_columns, args.fail_on_missing_columns)
+                if not columns:
+                    result = {"table": table_name, "checked": 0, "would_repair": 0, "missing_columns": missing}
+                    report.append(result)
+                    log_event("lance_repair_quoted_json_strings_table_skipped", **result)
+                    continue
+                checked, repaired = count_quoted_json_string_values(conn, table_ref, columns, args.limit if not args.apply else None)
+                result: JsonMap = {
+                    "table": table_name,
+                    "checked": checked,
+                    "would_repair": repaired,
+                    "missing_columns": missing,
+                    "sampled": bool(not args.apply and args.limit is not None),
+                    "sample_limit": args.limit if not args.apply else None,
+                    "old_version": old_version,
+                }
+                if args.apply:
+                    source_count = conn.execute(f"SELECT count(*) FROM {table_ref}").fetchone()[0]
+                    select_sql = build_repair_quoted_json_strings_select_sql(conn, table_ref, set(columns))
+                    temp_table = quote_identifier(f"repair_json_strings_{table_name}")
+                    overwritten = False
+                    try:
+                        conn.execute(f"CREATE OR REPLACE TEMP TABLE {temp_table} AS {select_sql}")
+                        temp_count = conn.execute(f"SELECT count(*) FROM {temp_table}").fetchone()[0]
+                        if source_count != temp_count:
+                            raise RuntimeError(f"repair count mismatch before overwrite: source={source_count} temp={temp_count}")
+                        conn.execute(f"COPY {temp_table} TO {table_ref} (FORMAT lance, MODE 'overwrite')")
+                        overwritten = True
+                        target_count = conn.execute(f"SELECT count(*) FROM {table_ref}").fetchone()[0]
+                        after_dataset = lance.dataset(dataset_uri)
+                        after_schema = arrow_schema_signature(after_dataset.schema)
+                        if source_count != target_count:
+                            raise RuntimeError(f"repair count mismatch after overwrite: source={source_count} target={target_count}")
+                        if before_schema != after_schema:
+                            raise RuntimeError(f"repair schema changed after overwrite: before={before_schema} after={after_schema}")
+                    except Exception:
+                        if overwritten:
+                            restore_lance_version(dataset_uri, old_version)
+                        raise
+                    result["source_count"] = source_count
+                    result["target_count"] = target_count
+                    result["new_version"] = int(lance.dataset(dataset_uri).version)
+                    if args.create_indexes:
+                        created, skipped = create_indexes_for_columns(conn, table_name, table_ref, repair_index_columns(args, table_name))
+                        result["generated_indexes"] = created
+                        result["index_skipped"] = skipped
+                report.append(result)
+                completed += 1
+                log_event("lance_repair_quoted_json_strings_table_completed", **result)
+            except Exception as exc:  # noqa: BLE001
+                failure = {"table": table_name, "error": repr(exc)}
+                failures.append(failure)
+                log_event("lance_repair_quoted_json_strings_table_failed", **failure)
+                if args.stop_on_failure:
+                    break
+    finally:
+        if conn is not None:
+            conn.close()
+        if state is not None and lease is not None:
+            release_lease(state, lease)
+    log_event("lance_repair_quoted_json_strings_finished", completed=completed, failed=len(failures), apply=args.apply)
+    print(json.dumps({"dry_run": not args.apply, "tables": report}, indent=2, sort_keys=True))
+    if failures:
+        print(json.dumps({"failures": failures}, indent=2, sort_keys=True), file=sys.stderr)
+        raise SystemExit(1)
+
+
+def parse_env_pairs(values: Iterable[str]) -> list[dict[str, str]]:
+    env: list[dict[str, str]] = []
+    for raw in values:
+        if "=" not in raw:
+            raise SystemExit(f"--env must be KEY=VALUE, got {raw!r}")
+        key, value = raw.split("=", 1)
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            raise SystemExit(f"Invalid env var name: {key}")
+        env.append({"name": key, "value": value})
+    return env
+
+
+def append_missing_env(env: list[dict[str, str]], defaults: dict[str, str]) -> None:
+    existing = {item["name"] for item in env}
+    env.extend({"name": key, "value": value} for key, value in defaults.items() if key not in existing)
+
+
+def parse_table_specs(args: argparse.Namespace) -> deque[tuple[str, str]]:
+    raw_tables: list[str] = []
+    if args.tables:
+        raw_tables.extend(part.strip() for part in args.tables.split(",") if part.strip())
+    if args.tables_file:
+        with open(args.tables_file, encoding="utf-8") as handle:
+            raw_tables.extend(line.strip() for line in handle if line.strip() and not line.strip().startswith("#"))
+    if not raw_tables:
+        raise SystemExit("--tables or --tables-file is required")
+
+    specs: deque[tuple[str, str]] = deque()
+    for raw in raw_tables:
+        source, _, target = raw.partition("=")
+        source = source.strip()
+        target = target.strip() or source_to_physical_table(source)
+        specs.append((source, target))
+    return specs
+
+
+def network_configuration(args: argparse.Namespace) -> JsonMap:
+    subnets = [item.strip() for item in args.subnets.split(",") if item.strip()]
+    security_groups = [item.strip() for item in args.security_groups.split(",") if item.strip()]
+    if not subnets or not security_groups:
+        raise SystemExit("--subnets and --security-groups are required")
+    return {
+        "awsvpcConfiguration": {
+            "subnets": subnets,
+            "securityGroups": security_groups,
+            "assignPublicIp": "ENABLED" if args.assign_public_ip else "DISABLED",
+        }
+    }
+
+
+def run_task(
+    ecs: Any,
+    args: argparse.Namespace,
+    source: str,
+    target: str,
+    command: list[str] | None = None,
+) -> str:
+    env = parse_env_pairs(args.env)
+    if command and command[0] == "create-lance-indexes":
+        append_missing_env(env, LANCE_SCALAR_INDEX_ENV)
+    env.extend(
+        [
+            {"name": "TABLE_NAME", "value": source},
+            {"name": "LANCE_TABLE_NAME", "value": target},
+        ]
+    )
+    if command is None or command[0] == "migrate-table":
+        env.append({"name": "ICEBERG_TABLE_NAME", "value": source})
+    kwargs: JsonMap = {
+        "cluster": args.cluster,
+        "taskDefinition": args.task_definition,
+        "networkConfiguration": network_configuration(args),
+        "overrides": {
+            "containerOverrides": [
+                {
+                    "name": args.container_name,
+                    "environment": env,
+                    **({"command": command} if command else {}),
+                }
+            ]
+        },
+        "startedBy": args.started_by,
+    }
+    if args.capacity_provider:
+        kwargs["capacityProviderStrategy"] = [{"capacityProvider": args.capacity_provider, "weight": 1}]
+    else:
+        kwargs["launchType"] = "FARGATE"
+    response = ecs.run_task(**kwargs)
+    if response.get("failures"):
+        raise RuntimeError(f"run_task failed for {source}: {response['failures']}")
+    tasks = response.get("tasks") or []
+    if not tasks:
+        raise RuntimeError(f"run_task returned no task for {source}")
+    return tasks[0]["taskArn"]
+
+
+def task_exit(task: JsonMap, container_name: str) -> tuple[bool, int | None, str | None]:
+    containers = task.get("containers") or []
+    selected = next((container for container in containers if container.get("name") == container_name), containers[0] if containers else {})
+    exit_code = selected.get("exitCode")
+    reason = selected.get("reason") or task.get("stoppedReason")
+    ok = task.get("lastStatus") == "STOPPED" and exit_code == 0
+    return ok, exit_code, reason
+
+
+def run_parallel(args: argparse.Namespace) -> None:
+    import boto3
+
+    args.cluster = env_or_arg(args, "cluster", "ECS_CLUSTER")
+    args.task_definition = env_or_arg(args, "task_definition", "LANCE_MIGRATION_TASK_DEFINITION")
+    pending = parse_table_specs(args)
+    ecs = boto3.client("ecs", region_name=args.aws_region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"))
+    running: dict[str, tuple[str, str]] = {}
+    failures: list[JsonMap] = []
+    completed = 0
+
+    while pending or running:
+        while pending and len(running) < args.concurrency:
+            source, target = pending.popleft()
+            task_arn = run_task(ecs, args, source, target)
+            running[task_arn] = (source, target)
+            log_event("lance_migration_task_started", table=source, target_table=target, task_arn=task_arn)
+
+        if not running:
+            continue
+
+        time.sleep(args.poll_seconds)
+        task_arns = list(running)
+        response = ecs.describe_tasks(cluster=args.cluster, tasks=task_arns)
+        if response.get("failures"):
+            for failure in response["failures"]:
+                arn = failure.get("arn")
+                source, target = running.pop(arn, ("unknown", "unknown"))
+                failures.append({"table": source, "target_table": target, "task_arn": arn, "failure": failure})
+                log_event("lance_migration_task_describe_failed", table=source, task_arn=arn, failure=failure)
+        for task in response.get("tasks", []):
+            if task.get("lastStatus") != "STOPPED":
+                continue
+            arn = task["taskArn"]
+            source, target = running.pop(arn)
+            ok, exit_code, reason = task_exit(task, args.container_name)
+            if ok:
+                completed += 1
+                log_event("lance_migration_task_completed", table=source, target_table=target, task_arn=arn)
+            else:
+                failure = {"table": source, "target_table": target, "task_arn": arn, "exit_code": exit_code, "reason": reason}
+                failures.append(failure)
+                log_event("lance_migration_task_failed", **failure)
+                if args.stop_on_failure:
+                    pending.clear()
+
+    log_event("lance_migration_parallel_finished", completed=completed, failed=len(failures))
+    if failures:
+        print(json.dumps({"failures": failures}, indent=2, sort_keys=True), file=sys.stderr)
+        raise SystemExit(1)
+
+
+def run_generated_parallel(args: argparse.Namespace) -> None:
+    import boto3
+
+    args.cluster = env_or_arg(args, "cluster", "ECS_CLUSTER")
+    args.task_definition = env_or_arg(args, "task_definition", "LANCE_MIGRATION_TASK_DEFINITION")
+    args.lance_bucket = args.lance_bucket or os.environ.get("LANCE_BUCKET")
+    args.aws_region = args.aws_region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    pending = deque((table, table) for table in list_lance_tables(args))
+    ecs = boto3.client("ecs", region_name=args.aws_region)
+    running: dict[str, tuple[str, str]] = {}
+    failures: list[JsonMap] = []
+    completed = 0
+
+    while pending or running:
+        while pending and len(running) < args.concurrency:
+            source, target = pending.popleft()
+            command = [
+                "backfill-generated-columns",
+                "--tables",
+                target,
+                "--lance-prefix",
+                args.lance_prefix,
+                "--duckdb-path",
+                args.duckdb_path,
+            ]
+            if args.create_indexes:
+                command.append("--create-indexes")
+            if args.lance_bucket:
+                command.extend(["--lance-bucket", args.lance_bucket])
+            if args.lance_root_uri:
+                command.extend(["--lance-root-uri", args.lance_root_uri])
+            task_arn = run_task(ecs, args, source, target, command=command)
+            running[task_arn] = (source, target)
+            log_event("lance_generated_backfill_task_started", table=source, target_table=target, task_arn=task_arn)
+
+        if not running:
+            continue
+
+        time.sleep(args.poll_seconds)
+        task_arns = list(running)
+        response = ecs.describe_tasks(cluster=args.cluster, tasks=task_arns)
+        if response.get("failures"):
+            for failure in response["failures"]:
+                arn = failure.get("arn")
+                source, target = running.pop(arn, ("unknown", "unknown"))
+                failures.append({"table": source, "target_table": target, "task_arn": arn, "failure": failure})
+                log_event("lance_generated_backfill_task_describe_failed", table=source, task_arn=arn, failure=failure)
+        for task in response.get("tasks", []):
+            if task.get("lastStatus") != "STOPPED":
+                continue
+            arn = task["taskArn"]
+            source, target = running.pop(arn)
+            ok, exit_code, reason = task_exit(task, args.container_name)
+            if ok:
+                completed += 1
+                log_event("lance_generated_backfill_task_completed", table=source, target_table=target, task_arn=arn)
+            else:
+                failure = {"table": source, "target_table": target, "task_arn": arn, "exit_code": exit_code, "reason": reason}
+                failures.append(failure)
+                log_event("lance_generated_backfill_task_failed", **failure)
+                if args.stop_on_failure:
+                    pending.clear()
+
+    log_event("lance_generated_backfill_parallel_finished", completed=completed, failed=len(failures))
+    if failures:
+        print(json.dumps({"failures": failures}, indent=2, sort_keys=True), file=sys.stderr)
+        raise SystemExit(1)
+
+
+def run_drop_current_parallel(args: argparse.Namespace) -> None:
+    import boto3
+
+    args.cluster = env_or_arg(args, "cluster", "ECS_CLUSTER")
+    args.task_definition = env_or_arg(args, "task_definition", "LANCE_MIGRATION_TASK_DEFINITION")
+    args.lance_bucket = args.lance_bucket or os.environ.get("LANCE_BUCKET")
+    args.aws_region = args.aws_region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    pending = deque((table, table) for table in list_lance_tables(args))
+    ecs = boto3.client("ecs", region_name=args.aws_region)
+    running: dict[str, tuple[str, str]] = {}
+    failures: list[JsonMap] = []
+    completed = 0
+
+    while pending or running:
+        while pending and len(running) < args.concurrency:
+            source, target = pending.popleft()
+            command = [
+                "drop-legacy-current",
+                "--tables",
+                target,
+                "--lance-prefix",
+                args.lance_prefix,
+                "--duckdb-path",
+                args.duckdb_path,
+            ]
+            if args.lance_bucket:
+                command.extend(["--lance-bucket", args.lance_bucket])
+            if args.lance_root_uri:
+                command.extend(["--lance-root-uri", args.lance_root_uri])
+            task_arn = run_task(ecs, args, source, target, command=command)
+            running[task_arn] = (source, target)
+            log_event("lance_drop_legacy_current_task_started", table=source, target_table=target, task_arn=task_arn)
+
+        if not running:
+            continue
+
+        time.sleep(args.poll_seconds)
+        response = ecs.describe_tasks(cluster=args.cluster, tasks=list(running))
+        if response.get("failures"):
+            for failure in response["failures"]:
+                arn = failure.get("arn")
+                source, target = running.pop(arn, ("unknown", "unknown"))
+                failures.append({"table": source, "target_table": target, "task_arn": arn, "failure": failure})
+                log_event("lance_drop_legacy_current_task_describe_failed", table=source, task_arn=arn, failure=failure)
+        for task in response.get("tasks", []):
+            if task.get("lastStatus") != "STOPPED":
+                continue
+            arn = task["taskArn"]
+            source, target = running.pop(arn)
+            ok, exit_code, reason = task_exit(task, args.container_name)
+            if ok:
+                completed += 1
+                log_event("lance_drop_legacy_current_task_completed", table=source, target_table=target, task_arn=arn)
+            else:
+                failure = {"table": source, "target_table": target, "task_arn": arn, "exit_code": exit_code, "reason": reason}
+                failures.append(failure)
+                log_event("lance_drop_legacy_current_task_failed", **failure)
+                if args.stop_on_failure:
+                    pending.clear()
+
+    log_event("lance_drop_legacy_current_parallel_finished", completed=completed, failed=len(failures))
+    if failures:
+        print(json.dumps({"failures": failures}, indent=2, sort_keys=True), file=sys.stderr)
+        raise SystemExit(1)
+
+
+def run_create_indexes_parallel(args: argparse.Namespace) -> None:
+    import boto3
+
+    args.cluster = env_or_arg(args, "cluster", "ECS_CLUSTER")
+    args.task_definition = env_or_arg(args, "task_definition", "LANCE_MIGRATION_TASK_DEFINITION")
+    args.lance_bucket = args.lance_bucket or os.environ.get("LANCE_BUCKET")
+    args.aws_region = args.aws_region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+    pending = deque((table, table) for table in list_lance_tables(args))
+    ecs = boto3.client("ecs", region_name=args.aws_region)
+    running: dict[str, tuple[str, str]] = {}
+    failures: list[JsonMap] = []
+    completed = 0
+
+    while pending or running:
+        while pending and len(running) < args.concurrency:
+            source, target = pending.popleft()
+            command = [
+                "create-lance-indexes",
+                "--tables",
+                target,
+                "--lance-prefix",
+                args.lance_prefix,
+                "--duckdb-path",
+                args.duckdb_path,
+            ]
+            command.append("--generated-indexes" if args.generated_indexes else "--no-generated-indexes")
+            command.append("--table-config-indexes" if args.table_config_indexes else "--no-table-config-indexes")
+            if args.lance_bucket:
+                command.extend(["--lance-bucket", args.lance_bucket])
+            if args.lance_root_uri:
+                command.extend(["--lance-root-uri", args.lance_root_uri])
+            if args.table_config_bucket:
+                command.extend(["--table-config-bucket", args.table_config_bucket])
+            if args.table_config_prefix:
+                command.extend(["--table-config-prefix", args.table_config_prefix])
+            if args.table_config_state_bucket:
+                command.extend(["--table-config-state-bucket", args.table_config_state_bucket])
+            if args.table_config_state_prefix:
+                command.extend(["--table-config-state-prefix", args.table_config_state_prefix])
+            task_arn = run_task(ecs, args, source, target, command=command)
+            running[task_arn] = (source, target)
+            log_event("lance_index_creation_task_started", table=source, target_table=target, task_arn=task_arn)
+
+        if not running:
+            continue
+
+        time.sleep(args.poll_seconds)
+        response = ecs.describe_tasks(cluster=args.cluster, tasks=list(running))
+        if response.get("failures"):
+            for failure in response["failures"]:
+                arn = failure.get("arn")
+                source, target = running.pop(arn, ("unknown", "unknown"))
+                failures.append({"table": source, "target_table": target, "task_arn": arn, "failure": failure})
+                log_event("lance_index_creation_task_describe_failed", table=source, task_arn=arn, failure=failure)
+        for task in response.get("tasks", []):
+            if task.get("lastStatus") != "STOPPED":
+                continue
+            arn = task["taskArn"]
+            source, target = running.pop(arn)
+            ok, exit_code, reason = task_exit(task, args.container_name)
+            if ok:
+                completed += 1
+                log_event("lance_index_creation_task_completed", table=source, target_table=target, task_arn=arn)
+            else:
+                failure = {"table": source, "target_table": target, "task_arn": arn, "exit_code": exit_code, "reason": reason}
+                failures.append(failure)
+                log_event("lance_index_creation_task_failed", **failure)
+                if args.stop_on_failure:
+                    pending.clear()
+
+    log_event("lance_index_creation_parallel_finished", completed=completed, failed=len(failures))
+    if failures:
+        print(json.dumps({"failures": failures}, indent=2, sort_keys=True), file=sys.stderr)
+        raise SystemExit(1)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="convexlance")
+    parser = argparse.ArgumentParser(prog="sirlance", description="Data Loader")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    migrate = sub.add_parser("migrate-table")
+    migrate.add_argument("--table")
+    migrate.add_argument("--source-table")
+    migrate.add_argument("--output-table")
+    migrate.add_argument("--namespace")
+    migrate.add_argument("--catalog-alias")
+    migrate.add_argument("--s3tables-warehouse-arn")
+    migrate.add_argument("--lance-bucket")
+    migrate.add_argument("--lance-prefix", default=os.environ.get("LANCE_PREFIX", "tables"))
+    migrate.add_argument("--lance-uri")
+    migrate.add_argument("--lance-scope")
+    migrate.add_argument("--mode", choices=["overwrite", "append"], default=os.environ.get("LANCE_WRITE_MODE", "overwrite"))
+    migrate.add_argument("--where")
+    migrate.add_argument("--order-by")
+    migrate.add_argument("--max-rows", type=int)
+    migrate.add_argument("--verify-count", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_VERIFY_COUNT", "true").lower() == "true")
+    migrate.add_argument(
+        "--create-generated-indexes",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("LANCE_CREATE_GENERATED_INDEXES", "true").lower() == "true",
+    )
+    migrate.add_argument("--table-config-indexes", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_TABLE_CONFIG_INDEXES", "true").lower() not in {"0", "false", "no"})
+    migrate.add_argument("--table-config-dir")
+    migrate.add_argument("--table-config-bucket")
+    migrate.add_argument("--table-config-prefix", default=os.environ.get("LANCE_TABLE_CONFIG_PREFIX", "config/lance/tables"))
+    migrate.add_argument("--table-config-state-bucket")
+    migrate.add_argument("--table-config-state-prefix", default=os.environ.get("LANCE_TABLE_CONFIG_STATE_PREFIX", DEFAULT_LANCE_TABLE_CONFIG_STATE_PREFIX))
+    migrate.add_argument("--duckdb-path")
+    migrate.add_argument("--threads", type=int, default=int(os.environ.get("DUCKDB_THREADS", "0")) or None)
+    migrate.add_argument("--memory-limit", default=os.environ.get("DUCKDB_MEMORY_LIMIT"))
+    migrate.add_argument("--temp-directory", default=os.environ.get("DUCKDB_TEMP_DIRECTORY"))
+    migrate.add_argument("--aws-region")
+    migrate.set_defaults(func=run_migrate_table)
+
     incremental = sub.add_parser("incremental-once")
-    add_incremental_arguments(incremental, loop=False)
+    incremental.add_argument("--convex-url")
+    incremental.add_argument("--convex-deploy-key")
+    incremental.add_argument("--state-bucket")
+    incremental.add_argument("--state-prefix")
+    incremental.add_argument("--cursor-key", default=os.environ.get("LANCE_INCREMENTAL_CURSOR_KEY", "incremental/cursor.json"))
+    incremental.add_argument("--schema-key", default=os.environ.get("LANCE_INCREMENTAL_SCHEMA_KEY", "incremental/schema.json"))
+    incremental.add_argument("--schema-refresh-seconds", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_SCHEMA_REFRESH_SECONDS", "600")))
+    incremental.add_argument("--reconcile-schema", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_INCREMENTAL_RECONCILE_SCHEMA", "true").lower() not in {"0", "false", "no"})
+    incremental.add_argument("--unknown-table-policy", choices=["fail", "create", "skip"], default=os.environ.get("LANCE_INCREMENTAL_UNKNOWN_TABLE_POLICY", "fail"))
+    incremental.add_argument("--table-config-indexes", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_TABLE_CONFIG_INDEXES", "true").lower() not in {"0", "false", "no"})
+    incremental.add_argument("--table-config-dir")
+    incremental.add_argument("--table-config-bucket")
+    incremental.add_argument("--table-config-prefix", default=os.environ.get("LANCE_TABLE_CONFIG_PREFIX", "config/lance/tables"))
+    incremental.add_argument("--table-config-state-bucket")
+    incremental.add_argument("--table-config-state-prefix", default=os.environ.get("LANCE_TABLE_CONFIG_STATE_PREFIX", DEFAULT_LANCE_TABLE_CONFIG_STATE_PREFIX))
+    incremental.add_argument("--lance-bucket")
+    incremental.add_argument("--lance-prefix", default=os.environ.get("LANCE_PREFIX", "tables"))
+    incremental.add_argument("--lance-root-uri")
+    incremental.add_argument("--lance-scope")
+    incremental.add_argument("--catalog-alias")
+    incremental.add_argument("--max-pages-per-sync", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_MAX_PAGES_PER_SYNC", "100")))
+    incremental.add_argument("--lock-ttl-seconds", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_LOCK_TTL_SECONDS", "300")))
+    incremental.add_argument("--force", action=argparse.BooleanOptionalAction, default=False)
+    incremental.add_argument("--duckdb-path", default=os.environ.get("LANCE_INCREMENTAL_DUCKDB_PATH", "/tmp/lance-incremental.duckdb"))
+    incremental.add_argument("--threads", type=int, default=int(os.environ.get("DUCKDB_THREADS", "0")) or None)
+    incremental.add_argument("--memory-limit", default=os.environ.get("DUCKDB_MEMORY_LIMIT"))
+    incremental.add_argument("--temp-directory", default=os.environ.get("DUCKDB_TEMP_DIRECTORY"))
+    incremental.add_argument("--aws-region")
     incremental.set_defaults(func=run_incremental_once)
 
     incremental_loop = sub.add_parser("incremental-loop")
-    add_incremental_arguments(incremental_loop, loop=True)
+    incremental_loop.add_argument("--convex-url")
+    incremental_loop.add_argument("--convex-deploy-key")
+    incremental_loop.add_argument("--state-bucket")
+    incremental_loop.add_argument("--state-prefix")
+    incremental_loop.add_argument("--cursor-key", default=os.environ.get("LANCE_INCREMENTAL_CURSOR_KEY", "incremental/cursor.json"))
+    incremental_loop.add_argument("--schema-key", default=os.environ.get("LANCE_INCREMENTAL_SCHEMA_KEY", "incremental/schema.json"))
+    incremental_loop.add_argument("--schema-refresh-seconds", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_SCHEMA_REFRESH_SECONDS", "600")))
+    incremental_loop.add_argument("--reconcile-schema", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_INCREMENTAL_RECONCILE_SCHEMA", "true").lower() not in {"0", "false", "no"})
+    incremental_loop.add_argument("--unknown-table-policy", choices=["fail", "create", "skip"], default=os.environ.get("LANCE_INCREMENTAL_UNKNOWN_TABLE_POLICY", "fail"))
+    incremental_loop.add_argument("--table-config-indexes", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_TABLE_CONFIG_INDEXES", "true").lower() not in {"0", "false", "no"})
+    incremental_loop.add_argument("--table-config-dir")
+    incremental_loop.add_argument("--table-config-bucket")
+    incremental_loop.add_argument("--table-config-prefix", default=os.environ.get("LANCE_TABLE_CONFIG_PREFIX", "config/lance/tables"))
+    incremental_loop.add_argument("--table-config-state-bucket")
+    incremental_loop.add_argument("--table-config-state-prefix", default=os.environ.get("LANCE_TABLE_CONFIG_STATE_PREFIX", DEFAULT_LANCE_TABLE_CONFIG_STATE_PREFIX))
+    incremental_loop.add_argument("--lance-bucket")
+    incremental_loop.add_argument("--lance-prefix", default=os.environ.get("LANCE_PREFIX", "tables"))
+    incremental_loop.add_argument("--lance-root-uri")
+    incremental_loop.add_argument("--lance-scope")
+    incremental_loop.add_argument("--catalog-alias")
+    incremental_loop.add_argument("--max-pages-per-sync", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_MAX_PAGES_PER_SYNC", "100")))
+    incremental_loop.add_argument("--sleep-seconds", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_SLEEP_SECONDS", "20")))
+    incremental_loop.add_argument("--optimize-touched-indices", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_INCREMENTAL_OPTIMIZE_TOUCHED_INDICES", "true").lower() not in {"0", "false", "no"})
+    incremental_loop.add_argument("--optimize-indices-pages", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_OPTIMIZE_INDICES_PAGES", "50")))
+    incremental_loop.add_argument("--optimize-indices-rows", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_OPTIMIZE_INDICES_ROWS", "5000")))
+    incremental_loop.add_argument("--optimize-indices-seconds", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_OPTIMIZE_INDICES_SECONDS", "900")))
+    incremental_loop.add_argument("--idle-maintenance", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_INCREMENTAL_IDLE_MAINTENANCE", "true").lower() not in {"0", "false", "no"})
+    incremental_loop.add_argument("--idle-maintenance-max-rows", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_IDLE_MAINTENANCE_MAX_ROWS", "0")))
+    incremental_loop.add_argument("--idle-maintenance-max-pages", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_IDLE_MAINTENANCE_MAX_PAGES", "1")))
+    incremental_loop.add_argument("--maintenance-state-key", default=os.environ.get("LANCE_INCREMENTAL_MAINTENANCE_STATE_KEY", "incremental/maintenance_state.json"))
+    incremental_loop.add_argument("--maintenance-audit-key-prefix", default=os.environ.get("LANCE_INCREMENTAL_MAINTENANCE_AUDIT_KEY_PREFIX", "incremental/maintenance-audit"))
+    incremental_loop.add_argument("--maintenance-tables")
+    incremental_loop.add_argument("--maintenance-tables-file")
+    incremental_loop.add_argument("--maintenance-optimize-indices-seconds", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_OPTIMIZE_INDICES_SECONDS", "3600")))
+    incremental_loop.add_argument("--maintenance-compact-files-seconds", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_COMPACT_FILES_SECONDS", "86400")))
+    incremental_loop.add_argument("--maintenance-cleanup-old-versions-seconds", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_CLEANUP_OLD_VERSIONS_SECONDS", "604800")))
+    incremental_loop.add_argument("--maintenance-cleanup-older-than-seconds", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_CLEANUP_OLDER_THAN_SECONDS", "259200")))
+    incremental_loop.add_argument("--maintenance-retain-versions", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_RETAIN_VERSIONS", "500")))
+    incremental_loop.add_argument("--maintenance-compact-threads", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_COMPACT_THREADS", "1")))
+    incremental_loop.add_argument("--maintenance-heavy-window-start-utc", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_HEAVY_WINDOW_START_UTC", "7")))
+    incremental_loop.add_argument("--maintenance-heavy-window-end-utc", type=int, default=int(os.environ.get("LANCE_MAINTENANCE_HEAVY_WINDOW_END_UTC", "12")))
+    incremental_loop.add_argument("--lock-ttl-seconds", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_LOCK_TTL_SECONDS", "300")))
+    incremental_loop.add_argument("--force", action=argparse.BooleanOptionalAction, default=False)
+    incremental_loop.add_argument("--duckdb-path", default=os.environ.get("LANCE_INCREMENTAL_DUCKDB_PATH", "/tmp/lance-incremental.duckdb"))
+    incremental_loop.add_argument("--threads", type=int, default=int(os.environ.get("DUCKDB_THREADS", "0")) or None)
+    incremental_loop.add_argument("--memory-limit", default=os.environ.get("DUCKDB_MEMORY_LIMIT"))
+    incremental_loop.add_argument("--temp-directory", default=os.environ.get("DUCKDB_TEMP_DIRECTORY"))
+    incremental_loop.add_argument("--aws-region")
     incremental_loop.set_defaults(func=run_incremental_loop)
+
+    generated = sub.add_parser("backfill-generated-columns")
+    generated.add_argument("--tables")
+    generated.add_argument("--tables-file")
+    generated.add_argument("--max-tables", type=int)
+    generated.add_argument("--lance-bucket")
+    generated.add_argument("--lance-prefix", default=os.environ.get("LANCE_PREFIX", "tables"))
+    generated.add_argument("--lance-root-uri")
+    generated.add_argument("--lance-scope")
+    generated.add_argument("--catalog-alias")
+    generated.add_argument("--create-indexes", action=argparse.BooleanOptionalAction, default=False)
+    generated.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=False)
+    generated.add_argument("--stop-on-failure", action=argparse.BooleanOptionalAction, default=True)
+    generated.add_argument("--duckdb-path")
+    generated.add_argument("--threads", type=int, default=int(os.environ.get("DUCKDB_THREADS", "0")) or None)
+    generated.add_argument("--memory-limit", default=os.environ.get("DUCKDB_MEMORY_LIMIT"))
+    generated.add_argument("--temp-directory", default=os.environ.get("DUCKDB_TEMP_DIRECTORY"))
+    generated.add_argument("--aws-region")
+    generated.set_defaults(func=run_backfill_generated_columns)
+
+    drop_current = sub.add_parser("drop-legacy-current")
+    drop_current.add_argument("--tables")
+    drop_current.add_argument("--tables-file")
+    drop_current.add_argument("--max-tables", type=int)
+    drop_current.add_argument("--lance-bucket")
+    drop_current.add_argument("--lance-prefix", default=os.environ.get("LANCE_PREFIX", "tables"))
+    drop_current.add_argument("--lance-root-uri")
+    drop_current.add_argument("--lance-scope")
+    drop_current.add_argument("--catalog-alias")
+    drop_current.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=False)
+    drop_current.add_argument("--stop-on-failure", action=argparse.BooleanOptionalAction, default=True)
+    drop_current.add_argument("--duckdb-path", default=os.environ.get("LANCE_DROP_CURRENT_DUCKDB_PATH", "/tmp/lance-drop-current.duckdb"))
+    drop_current.add_argument("--threads", type=int, default=int(os.environ.get("DUCKDB_THREADS", "0")) or None)
+    drop_current.add_argument("--memory-limit", default=os.environ.get("DUCKDB_MEMORY_LIMIT"))
+    drop_current.add_argument("--temp-directory", default=os.environ.get("DUCKDB_TEMP_DIRECTORY"))
+    drop_current.add_argument("--aws-region")
+    drop_current.set_defaults(func=run_drop_legacy_current)
+
+    discover_repairs = sub.add_parser("discover-quoted-json-string-repairs")
+    discover_repairs.add_argument("--convex-url")
+    discover_repairs.add_argument("--convex-deploy-key")
+    discover_repairs.add_argument("--schema-json")
+    discover_repairs.add_argument("--tables")
+    discover_repairs.add_argument("--tables-file")
+    discover_repairs.add_argument("--max-tables", type=int)
+    discover_repairs.add_argument("--limit", type=int, default=10000)
+    discover_repairs.add_argument("--include-skipped", action=argparse.BooleanOptionalAction, default=False)
+    discover_repairs.add_argument("--lance-bucket")
+    discover_repairs.add_argument("--lance-prefix", default=os.environ.get("LANCE_PREFIX", "tables"))
+    discover_repairs.add_argument("--lance-root-uri")
+    discover_repairs.add_argument("--lance-scope")
+    discover_repairs.add_argument("--stop-on-failure", action=argparse.BooleanOptionalAction, default=True)
+    discover_repairs.add_argument("--duckdb-path", default=os.environ.get("LANCE_REPAIR_DISCOVERY_DUCKDB_PATH", ":memory:"))
+    discover_repairs.add_argument("--threads", type=int, default=int(os.environ.get("DUCKDB_THREADS", "0")) or None)
+    discover_repairs.add_argument("--memory-limit", default=os.environ.get("DUCKDB_MEMORY_LIMIT"))
+    discover_repairs.add_argument("--temp-directory", default=os.environ.get("DUCKDB_TEMP_DIRECTORY"))
+    discover_repairs.add_argument("--aws-region")
+    discover_repairs.set_defaults(func=run_discover_quoted_json_string_repairs)
+
+    repair_json_strings = sub.add_parser("repair-quoted-json-strings")
+    repair_json_strings.add_argument("--tables")
+    repair_json_strings.add_argument("--tables-file")
+    repair_json_strings.add_argument("--max-tables", type=int)
+    repair_json_strings.add_argument("--columns", required=True)
+    repair_json_strings.add_argument("--limit", type=int, default=1000)
+    repair_json_strings.add_argument("--lance-bucket")
+    repair_json_strings.add_argument("--lance-prefix", default=os.environ.get("LANCE_PREFIX", "tables"))
+    repair_json_strings.add_argument("--lance-root-uri")
+    repair_json_strings.add_argument("--lance-scope")
+    repair_json_strings.add_argument("--apply", action=argparse.BooleanOptionalAction, default=False)
+    repair_json_strings.add_argument("--create-indexes", action=argparse.BooleanOptionalAction, default=True)
+    repair_json_strings.add_argument("--generated-indexes", action=argparse.BooleanOptionalAction, default=True)
+    repair_json_strings.add_argument("--hot-indexes", action=argparse.BooleanOptionalAction, default=True)
+    repair_json_strings.add_argument("--table-config-indexes", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_TABLE_CONFIG_INDEXES", "true").lower() not in {"0", "false", "no"})
+    repair_json_strings.add_argument("--table-config-dir")
+    repair_json_strings.add_argument("--table-config-bucket")
+    repair_json_strings.add_argument("--table-config-prefix", default=os.environ.get("LANCE_TABLE_CONFIG_PREFIX", "config/lance/tables"))
+    repair_json_strings.add_argument("--table-config-state-bucket")
+    repair_json_strings.add_argument("--table-config-state-prefix", default=os.environ.get("LANCE_TABLE_CONFIG_STATE_PREFIX", DEFAULT_LANCE_TABLE_CONFIG_STATE_PREFIX))
+    repair_json_strings.add_argument("--fail-on-missing-columns", action=argparse.BooleanOptionalAction, default=True)
+    repair_json_strings.add_argument("--use-lock", action=argparse.BooleanOptionalAction, default=True)
+    repair_json_strings.add_argument("--state-bucket")
+    repair_json_strings.add_argument("--state-prefix")
+    repair_json_strings.add_argument("--lock-ttl-seconds", type=int, default=int(os.environ.get("LANCE_REPAIR_LOCK_TTL_SECONDS", "3600")))
+    repair_json_strings.add_argument("--force", action=argparse.BooleanOptionalAction, default=False)
+    repair_json_strings.add_argument("--stop-on-failure", action=argparse.BooleanOptionalAction, default=True)
+    repair_json_strings.add_argument("--duckdb-path", default=os.environ.get("LANCE_REPAIR_DUCKDB_PATH", "/tmp/lance-repair.duckdb"))
+    repair_json_strings.add_argument("--threads", type=int, default=int(os.environ.get("DUCKDB_THREADS", "0")) or None)
+    repair_json_strings.add_argument("--memory-limit", default=os.environ.get("DUCKDB_MEMORY_LIMIT"))
+    repair_json_strings.add_argument("--temp-directory", default=os.environ.get("DUCKDB_TEMP_DIRECTORY"))
+    repair_json_strings.add_argument("--aws-region")
+    repair_json_strings.set_defaults(func=run_repair_quoted_json_strings)
+
+    create_indexes = sub.add_parser("create-lance-indexes")
+    create_indexes.add_argument("--tables")
+    create_indexes.add_argument("--tables-file")
+    create_indexes.add_argument("--max-tables", type=int)
+    create_indexes.add_argument("--lance-bucket")
+    create_indexes.add_argument("--lance-prefix", default=os.environ.get("LANCE_PREFIX", "tables"))
+    create_indexes.add_argument("--lance-root-uri")
+    create_indexes.add_argument("--lance-scope")
+    create_indexes.add_argument("--generated-indexes", action=argparse.BooleanOptionalAction, default=True)
+    create_indexes.add_argument("--hot-indexes", action=argparse.BooleanOptionalAction, default=True)
+    create_indexes.add_argument("--table-config-indexes", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_TABLE_CONFIG_INDEXES", "true").lower() not in {"0", "false", "no"})
+    create_indexes.add_argument("--table-config-dir")
+    create_indexes.add_argument("--table-config-bucket")
+    create_indexes.add_argument("--table-config-prefix", default=os.environ.get("LANCE_TABLE_CONFIG_PREFIX", "config/lance/tables"))
+    create_indexes.add_argument("--table-config-state-bucket")
+    create_indexes.add_argument("--table-config-state-prefix", default=os.environ.get("LANCE_TABLE_CONFIG_STATE_PREFIX", DEFAULT_LANCE_TABLE_CONFIG_STATE_PREFIX))
+    create_indexes.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=False)
+    create_indexes.add_argument("--stop-on-failure", action=argparse.BooleanOptionalAction, default=True)
+    create_indexes.add_argument("--duckdb-path", default=os.environ.get("LANCE_INDEX_DUCKDB_PATH", "/tmp/lance-indexes.duckdb"))
+    create_indexes.add_argument("--threads", type=int, default=int(os.environ.get("DUCKDB_THREADS", "0")) or None)
+    create_indexes.add_argument("--memory-limit", default=os.environ.get("DUCKDB_MEMORY_LIMIT"))
+    create_indexes.add_argument("--temp-directory", default=os.environ.get("DUCKDB_TEMP_DIRECTORY"))
+    create_indexes.add_argument("--aws-region")
+    create_indexes.set_defaults(func=run_create_lance_indexes)
+
+    parallel = sub.add_parser("run-parallel")
+    parallel.add_argument("--tables")
+    parallel.add_argument("--tables-file")
+    parallel.add_argument("--concurrency", type=int, default=int(os.environ.get("LANCE_MIGRATION_CONCURRENCY", "4")))
+    parallel.add_argument("--cluster")
+    parallel.add_argument("--task-definition")
+    parallel.add_argument("--container-name", default=os.environ.get("LANCE_MIGRATION_CONTAINER_NAME", "lance-migration"))
+    parallel.add_argument("--subnets", default=os.environ.get("ECS_SUBNETS", ""))
+    parallel.add_argument("--security-groups", default=os.environ.get("ECS_SECURITY_GROUPS", ""))
+    parallel.add_argument("--assign-public-ip", action=argparse.BooleanOptionalAction, default=os.environ.get("ECS_ASSIGN_PUBLIC_IP", "true").lower() == "true")
+    parallel.add_argument("--capacity-provider", default=os.environ.get("ECS_CAPACITY_PROVIDER"))
+    parallel.add_argument("--started-by", default=os.environ.get("ECS_STARTED_BY", "lance-migration-runner"))
+    parallel.add_argument("--poll-seconds", type=int, default=int(os.environ.get("LANCE_MIGRATION_POLL_SECONDS", "20")))
+    parallel.add_argument("--stop-on-failure", action=argparse.BooleanOptionalAction, default=True)
+    parallel.add_argument("--env", action="append", default=[])
+    parallel.add_argument("--aws-region")
+    parallel.set_defaults(func=run_parallel)
+
+    generated_parallel = sub.add_parser("run-generated-parallel")
+    generated_parallel.add_argument("--tables")
+    generated_parallel.add_argument("--tables-file")
+    generated_parallel.add_argument("--max-tables", type=int)
+    generated_parallel.add_argument("--concurrency", type=int, default=int(os.environ.get("LANCE_GENERATED_BACKFILL_CONCURRENCY", "4")))
+    generated_parallel.add_argument("--cluster")
+    generated_parallel.add_argument("--task-definition")
+    generated_parallel.add_argument("--container-name", default=os.environ.get("LANCE_MIGRATION_CONTAINER_NAME", "lance-migration"))
+    generated_parallel.add_argument("--subnets", default=os.environ.get("ECS_SUBNETS", ""))
+    generated_parallel.add_argument("--security-groups", default=os.environ.get("ECS_SECURITY_GROUPS", ""))
+    generated_parallel.add_argument("--assign-public-ip", action=argparse.BooleanOptionalAction, default=os.environ.get("ECS_ASSIGN_PUBLIC_IP", "true").lower() == "true")
+    generated_parallel.add_argument("--capacity-provider", default=os.environ.get("ECS_CAPACITY_PROVIDER"))
+    generated_parallel.add_argument("--started-by", default=os.environ.get("ECS_STARTED_BY", "lance-generated-backfill-runner"))
+    generated_parallel.add_argument("--poll-seconds", type=int, default=int(os.environ.get("LANCE_MIGRATION_POLL_SECONDS", "20")))
+    generated_parallel.add_argument("--stop-on-failure", action=argparse.BooleanOptionalAction, default=True)
+    generated_parallel.add_argument("--env", action="append", default=[])
+    generated_parallel.add_argument("--lance-bucket")
+    generated_parallel.add_argument("--lance-prefix", default=os.environ.get("LANCE_PREFIX", "tables"))
+    generated_parallel.add_argument("--lance-root-uri")
+    generated_parallel.add_argument("--create-indexes", action=argparse.BooleanOptionalAction, default=False)
+    generated_parallel.add_argument("--duckdb-path", default=os.environ.get("LANCE_GENERATED_BACKFILL_DUCKDB_PATH", "/tmp/lance-generated-backfill.duckdb"))
+    generated_parallel.add_argument("--aws-region")
+    generated_parallel.set_defaults(func=run_generated_parallel)
+
+    drop_current_parallel = sub.add_parser("run-drop-current-parallel")
+    drop_current_parallel.add_argument("--tables")
+    drop_current_parallel.add_argument("--tables-file")
+    drop_current_parallel.add_argument("--max-tables", type=int)
+    drop_current_parallel.add_argument("--concurrency", type=int, default=int(os.environ.get("LANCE_DROP_CURRENT_CONCURRENCY", "4")))
+    drop_current_parallel.add_argument("--cluster")
+    drop_current_parallel.add_argument("--task-definition")
+    drop_current_parallel.add_argument("--container-name", default=os.environ.get("LANCE_MIGRATION_CONTAINER_NAME", "lance-migration"))
+    drop_current_parallel.add_argument("--subnets", default=os.environ.get("ECS_SUBNETS", ""))
+    drop_current_parallel.add_argument("--security-groups", default=os.environ.get("ECS_SECURITY_GROUPS", ""))
+    drop_current_parallel.add_argument("--assign-public-ip", action=argparse.BooleanOptionalAction, default=os.environ.get("ECS_ASSIGN_PUBLIC_IP", "true").lower() == "true")
+    drop_current_parallel.add_argument("--capacity-provider", default=os.environ.get("ECS_CAPACITY_PROVIDER"))
+    drop_current_parallel.add_argument("--started-by", default=os.environ.get("ECS_STARTED_BY", "lance-drop-current-runner"))
+    drop_current_parallel.add_argument("--poll-seconds", type=int, default=int(os.environ.get("LANCE_MIGRATION_POLL_SECONDS", "20")))
+    drop_current_parallel.add_argument("--stop-on-failure", action=argparse.BooleanOptionalAction, default=True)
+    drop_current_parallel.add_argument("--env", action="append", default=[])
+    drop_current_parallel.add_argument("--lance-bucket")
+    drop_current_parallel.add_argument("--lance-prefix", default=os.environ.get("LANCE_PREFIX", "tables"))
+    drop_current_parallel.add_argument("--lance-root-uri")
+    drop_current_parallel.add_argument("--duckdb-path", default=os.environ.get("LANCE_DROP_CURRENT_DUCKDB_PATH", "/tmp/lance-drop-current.duckdb"))
+    drop_current_parallel.add_argument("--aws-region")
+    drop_current_parallel.set_defaults(func=run_drop_current_parallel)
+
+    indexes_parallel = sub.add_parser("run-create-indexes-parallel")
+    indexes_parallel.add_argument("--tables")
+    indexes_parallel.add_argument("--tables-file")
+    indexes_parallel.add_argument("--max-tables", type=int)
+    indexes_parallel.add_argument("--concurrency", type=int, default=int(os.environ.get("LANCE_INDEX_CONCURRENCY", "4")))
+    indexes_parallel.add_argument("--cluster")
+    indexes_parallel.add_argument("--task-definition")
+    indexes_parallel.add_argument("--container-name", default=os.environ.get("LANCE_MIGRATION_CONTAINER_NAME", "lance-migration"))
+    indexes_parallel.add_argument("--subnets", default=os.environ.get("ECS_SUBNETS", ""))
+    indexes_parallel.add_argument("--security-groups", default=os.environ.get("ECS_SECURITY_GROUPS", ""))
+    indexes_parallel.add_argument("--assign-public-ip", action=argparse.BooleanOptionalAction, default=os.environ.get("ECS_ASSIGN_PUBLIC_IP", "true").lower() == "true")
+    indexes_parallel.add_argument("--capacity-provider", default=os.environ.get("ECS_CAPACITY_PROVIDER"))
+    indexes_parallel.add_argument("--started-by", default=os.environ.get("ECS_STARTED_BY", "lance-index-creation-runner"))
+    indexes_parallel.add_argument("--poll-seconds", type=int, default=int(os.environ.get("LANCE_MIGRATION_POLL_SECONDS", "20")))
+    indexes_parallel.add_argument("--stop-on-failure", action=argparse.BooleanOptionalAction, default=True)
+    indexes_parallel.add_argument("--env", action="append", default=[])
+    indexes_parallel.add_argument("--lance-bucket")
+    indexes_parallel.add_argument("--lance-prefix", default=os.environ.get("LANCE_PREFIX", "tables"))
+    indexes_parallel.add_argument("--lance-root-uri")
+    indexes_parallel.add_argument("--generated-indexes", action=argparse.BooleanOptionalAction, default=True)
+    indexes_parallel.add_argument("--hot-indexes", action=argparse.BooleanOptionalAction, default=True)
+    indexes_parallel.add_argument("--table-config-indexes", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_TABLE_CONFIG_INDEXES", "true").lower() not in {"0", "false", "no"})
+    indexes_parallel.add_argument("--table-config-bucket")
+    indexes_parallel.add_argument("--table-config-prefix", default=os.environ.get("LANCE_TABLE_CONFIG_PREFIX", "config/lance/tables"))
+    indexes_parallel.add_argument("--table-config-state-bucket")
+    indexes_parallel.add_argument("--table-config-state-prefix", default=os.environ.get("LANCE_TABLE_CONFIG_STATE_PREFIX", DEFAULT_LANCE_TABLE_CONFIG_STATE_PREFIX))
+    indexes_parallel.add_argument("--duckdb-path", default=os.environ.get("LANCE_INDEX_DUCKDB_PATH", "/tmp/lance-indexes.duckdb"))
+    indexes_parallel.add_argument("--aws-region")
+    indexes_parallel.set_defaults(func=run_create_indexes_parallel)
     return parser
 
 
 def main() -> None:
-    install_signal_handlers()
     args = build_parser().parse_args()
     args.func(args)
 

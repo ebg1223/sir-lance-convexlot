@@ -1,25 +1,52 @@
-import contextlib
-import io
 from argparse import Namespace
-import time
+import tempfile
 import unittest
 
-import convexlance.cli as cli
 from convexlance.cli import (
-    build_parser,
+    ColumnSpec,
+    arrow_schema_signature,
+    build_repair_quoted_json_strings_select_sql,
+    build_select_sql,
     create_indexes_for_columns,
+    dataset_index_names,
+    decode_json_string_literal,
+    desired_repair_columns_from_schema,
+    desired_index_names,
     generated_index_columns,
-    install_signal_handlers,
+    infer_kind,
+    load_table_config,
+    normalize_rows_for_specs,
+    physical_to_source_schema_map,
     prepare_incremental_merge_rows,
-    request_shutdown,
-    run_idle_maintenance_once,
-    run_maintenance_action_with_timeout,
-    schema_column_specs,
-    should_run_idle_maintenance,
-    shutdown_requested,
-    shutdown_signal,
-    _shutdown_event,
+    read_applied_table_config_version,
+    reconcile_table_config_for_dataset,
+    requested_index_specs,
+    table_config_state_key,
+    validate_repair_columns,
+    write_applied_table_config_state,
+    _lance_in_filter,
+    _schema_type_alteration,
+    _schema_types_compatible,
+    _status_id_filter_values,
 )
+
+
+class FakeConn:
+    def execute(self, sql: str):
+        assert sql == 'DESCRIBE "s3tables"."convex"."Records"'
+        return self
+
+    def fetchall(self):
+        return [
+            ("_id",),
+            ("_ts",),
+            ("_current",),
+            ("_deleted",),
+            ("recordId",),
+            ("__status",),
+            ("__status_id",),
+            ("__id_ts",),
+        ]
 
 
 class FakeIndexConn:
@@ -34,18 +61,79 @@ class FakeIndexConn:
         return [("__id_ts",), ("__status_id",), ("__status",)]
 
 
+class FakeRepairConn:
+    def execute(self, sql: str):
+        assert sql == "DESCRIBE 's3://bucket/tables/records.lance'"
+        return self
+
+    def fetchall(self):
+        return [("_id",), ("recordId",), ("payload",)]
+
+
+class FakeDataset:
+    def __init__(self, schema):
+        self.schema = schema
+
+
+class FakeIndex:
+    def __init__(self, name):
+        self.name = name
+
+
+class FakeIndexDataset:
+    def list_indices(self):
+        return [FakeIndex("records___id_ts_idx"), {"name": "records_id_idx"}, "records_old_idx"]
+
+
 class FakeState:
-    pass
+    def __init__(self):
+        self.values = {}
+
+    def read(self, name: str):
+        return self.values.get(name)
+
+    def write(self, name: str, value):
+        self.values[name] = value
+        return '"etag"'
 
 
-class ConvexLanceCliTest(unittest.TestCase):
-    def test_parser_exposes_only_incremental_commands(self):
-        parser = build_parser()
+class BuildSelectSqlTest(unittest.TestCase):
+    def test_schema_types_accept_legacy_lance_columns(self):
+        import pyarrow as pa
 
-        self.assertEqual(parser.parse_args(["incremental-once"]).__dict__["func"].__name__, "run_incremental_once")
-        self.assertEqual(parser.parse_args(["incremental-loop"]).__dict__["func"].__name__, "run_incremental_loop")
-        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            parser.parse_args(["migrate-table"])
+        self.assertTrue(_schema_types_compatible(pa.int64(), pa.int8()))
+        self.assertTrue(_schema_types_compatible(pa.large_string(), pa.string()))
+        self.assertFalse(_schema_types_compatible(pa.string(), pa.float64()))
+        self.assertFalse(_schema_types_compatible(pa.int64(), pa.float64()))
+
+    def test_schema_type_alteration_allows_safe_widening(self):
+        import pyarrow as pa
+
+        self.assertEqual(_schema_type_alteration(pa.int32(), pa.int64()), {"data_type": pa.int64()})
+        self.assertIsNone(_schema_type_alteration(pa.int64(), pa.float64()))
+        self.assertIsNone(_schema_type_alteration(pa.float64(), pa.string()))
+        self.assertIsNone(_schema_type_alteration(pa.string(), pa.float64()))
+
+    def test_build_select_sql_generates_selected_columns(self):
+        args = Namespace(
+            catalog_alias="s3tables",
+            namespace="convex",
+            where=None,
+            order_by=None,
+            max_rows=None,
+        )
+
+        query = build_select_sql(FakeConn(), args, "Records")
+
+        self.assertNotIn('"_current"', query)
+        self.assertNotIn('"__status"', query)
+        self.assertIn('"_id", "_ts", "_deleted", "recordId"', query)
+        self.assertIn("AS __status", query)
+        self.assertIn("AS __status_id", query)
+        self.assertIn("AS __id_ts", query)
+        self.assertIn("COALESCE(_current, FALSE)", query)
+        self.assertIn("COALESCE(_deleted, FALSE)", query)
+        self.assertIn("CAST(_id AS VARCHAR) || '#' || CAST(_ts AS VARCHAR)", query)
 
     def test_create_indexes_for_generated_columns(self):
         conn = FakeIndexConn()
@@ -54,15 +142,56 @@ class ConvexLanceCliTest(unittest.TestCase):
 
         self.assertEqual(created, 3)
         self.assertEqual(skipped, [])
-        self.assertIn("CREATE INDEX records___id_ts_idx ON 's3://bucket/tables/records.lance' (__id_ts) USING BTREE", conn.statements)
-        self.assertIn("CREATE INDEX records___status_id_idx ON 's3://bucket/tables/records.lance' (__status_id) USING BTREE", conn.statements)
-        self.assertIn("CREATE INDEX records___status_idx ON 's3://bucket/tables/records.lance' (__status) USING BITMAP", conn.statements)
+        self.assertIn('CREATE INDEX records___id_ts_idx ON \'s3://bucket/tables/records.lance\' ("__id_ts") USING BTREE', conn.statements)
+        self.assertIn('CREATE INDEX records___status_id_idx ON \'s3://bucket/tables/records.lance\' ("__status_id") USING BTREE', conn.statements)
+        self.assertIn('CREATE INDEX records___status_idx ON \'s3://bucket/tables/records.lance\' ("__status") USING BITMAP', conn.statements)
 
-    def test_schema_column_specs_uses_int8_status(self):
-        specs = {column.name: column for column in schema_column_specs({"type": "object", "properties": {}})}
+    def test_table_config_filename_identifies_table_and_hash_versions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(f"{tmp}/recordworkitems.toml", "w", encoding="utf-8") as handle:
+                handle.write('[[indexes]]\ncolumn = "recordPointer"\ntype = "btree"\n')
 
-        self.assertEqual(specs["__status"].kind, "int8")
-        self.assertTrue(specs["__status"].required)
+            config = load_table_config(Namespace(table_config_dir=tmp, table_config_bucket=None, table_config_prefix=None), "recordworkitems")
+
+        self.assertIsNotNone(config)
+        assert config is not None
+        self.assertEqual(config.table_name, "recordworkitems")
+        self.assertTrue(config.version.startswith("sha256:"))
+        self.assertEqual([(idx.column, idx.index_type, idx.name) for idx in config.indexes], [("recordPointer", "BTREE", None)])
+
+    def test_requested_index_specs_combines_generated_and_table_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(f"{tmp}/records.toml", "w", encoding="utf-8") as handle:
+                handle.write('[[indexes]]\ncolumn = "__id_ts"\ntype = "BTREE"\n\n[[indexes]]\ncolumn = "id"\ntype = "BTREE"\n')
+
+            requested, config = requested_index_specs(
+                Namespace(generated_indexes=True, table_config_indexes=True, table_config_dir=tmp, table_config_bucket=None, table_config_prefix=None),
+                "records",
+            )
+
+        self.assertIsNotNone(config)
+        self.assertEqual([(idx.column, idx.index_type) for idx in requested], [("__id_ts", "BTREE"), ("__status_id", "BTREE"), ("__status", "BITMAP"), ("id", "BTREE")])
+
+    def test_dataset_index_names_detects_extra_indexes(self):
+        desired = desired_index_names("records", generated_index_columns())
+
+        extra = dataset_index_names(FakeIndexDataset()) - desired
+
+        self.assertEqual(extra, {"records_id_idx", "records_old_idx"})
+
+    def test_table_config_applied_state_uses_external_json_state(self):
+        state = FakeState()
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(f"{tmp}/recordworkitems.toml", "w", encoding="utf-8") as handle:
+                handle.write('[[indexes]]\ncolumn = "recordPointer"\ntype = "BTREE"\n')
+            config = load_table_config(Namespace(table_config_dir=tmp, table_config_bucket=None, table_config_prefix=None), "recordworkitems")
+
+        write_applied_table_config_state(state, "Record Work Items", config, 1, [])
+
+        self.assertEqual(table_config_state_key("Record Work Items"), "record_work_items.json")
+        self.assertEqual(read_applied_table_config_version(state, "Record Work Items"), config.version)
+        self.assertEqual(state.values["record_work_items.json"]["table"], "record_work_items")
+        self.assertEqual(state.values["record_work_items.json"]["created_indexes"], 1)
 
     def test_prepare_incremental_merge_rows_derives_current(self):
         incoming = [
@@ -76,9 +205,13 @@ class ConvexLanceCliTest(unittest.TestCase):
         by_version = {row["__id_ts"]: row for row in rows}
 
         self.assertEqual(by_version["a#100"]["__status"], 0)
+        self.assertEqual(by_version["a#100"]["__status_id"], "0#a")
         self.assertEqual(by_version["a#200"]["__status"], 3)
+        self.assertEqual(by_version["a#200"]["__status_id"], "3#a")
         self.assertEqual(by_version["a#150"]["__status"], 0)
+        self.assertEqual(by_version["a#150"]["__status_id"], "0#a")
         self.assertEqual(by_version["b#50"]["__status"], 1)
+        self.assertEqual(by_version["b#50"]["__status_id"], "1#b")
         self.assertNotIn("_current", by_version["a#200"])
 
     def test_prepare_incremental_merge_rows_preserves_existing_current_for_older_delta(self):
@@ -92,56 +225,118 @@ class ConvexLanceCliTest(unittest.TestCase):
         self.assertEqual(rows[0]["__status"], 0)
         self.assertEqual(rows[0]["__status_id"], "0#a")
 
-    def setUp(self):
-        _shutdown_event.clear()
+    def test_infer_kind_mixed_string_number_prefers_string(self):
+        schema = {"anyOf": [{"type": "string"}, {"type": "number"}]}
 
-    def tearDown(self):
-        _shutdown_event.clear()
+        self.assertEqual(infer_kind(schema), ("string", False, None))
 
-    def test_signal_handler_requests_deferred_shutdown(self):
-        request_shutdown(15, None)
+    def test_infer_kind_complex_values_are_json(self):
+        self.assertEqual(infer_kind({"type": "array", "items": {"type": "object", "properties": {"a": {"type": "string"}}}}), ("json", False, None))
+        self.assertEqual(infer_kind({"type": "object", "properties": {"a": {"type": "string"}}}), ("json", False, None))
+        self.assertEqual(infer_kind({"x-convex": "record"}), ("json", False, None))
+        self.assertEqual(infer_kind({}), ("json", False, None))
+        self.assertEqual(infer_kind({"anyOf": [{"type": "null"}, {}]}), ("json", True, None))
+        self.assertEqual(infer_kind({"anyOf": [{"type": "null"}, {"type": "string"}, {}]}), ("json", True, None))
 
-        self.assertTrue(shutdown_requested())
-        self.assertEqual(shutdown_signal(), "SIGTERM")
+    def test_infer_kind_scalar_arrays_stay_arrays(self):
+        self.assertEqual(infer_kind({"type": "array", "items": {"type": "string"}}), ("array", False, "string"))
+        self.assertEqual(infer_kind({"type": "array", "items": {"type": "number"}}), ("array", False, "float64"))
 
-    def test_install_signal_handlers(self):
-        install_signal_handlers()
+    def test_infer_kind_numeric_and_boolean(self):
+        self.assertEqual(infer_kind({"anyOf": [{"type": "integer"}, {"type": "number"}]}), ("float64", False, None))
+        self.assertEqual(infer_kind({"anyOf": [{"type": "boolean"}, {"type": "integer"}]}), ("int64", False, None))
+        self.assertEqual(infer_kind({"type": "integer"}), ("int64", False, None))
+        self.assertEqual(infer_kind({"type": "boolean"}), ("bool", False, None))
 
-    def test_idle_maintenance_skips_when_shutdown_requested(self):
-        request_shutdown(15, None)
-        args = build_parser().parse_args(["incremental-loop"])
+    def test_normalize_rows_for_specs_preserves_scalar_strings(self):
+        rows = normalize_rows_for_specs(
+            [{"json_col": "abc", "string_col": {"a": 1}, "int_col": "nope", "bool_col": "true"}],
+            [
+                ColumnSpec("json_col", "json"),
+                ColumnSpec("string_col", "string"),
+                ColumnSpec("int_col", "int64"),
+                ColumnSpec("bool_col", "bool"),
+            ],
+        )
 
-        self.assertFalse(run_idle_maintenance_once(args, FakeState()))
+        self.assertEqual(rows[0]["json_col"], "abc")
+        self.assertEqual(rows[0]["string_col"], '{"a":1}')
+        self.assertIsNone(rows[0]["int_col"])
+        self.assertIsNone(rows[0]["bool_col"])
 
-    def test_idle_maintenance_not_selected_when_shutdown_requested(self):
-        request_shutdown(15, None)
-        args = build_parser().parse_args(["incremental-loop"])
+    def test_normalize_rows_for_specs_json_encodes_complex_values(self):
+        rows = normalize_rows_for_specs([{"json_col": {"a": 1}, "list_col": [1, 2]}], [ColumnSpec("json_col", "json"), ColumnSpec("list_col", "json")])
 
-        self.assertFalse(should_run_idle_maintenance(args, {"rows_accepted": 0, "pages": 1}))
+        self.assertEqual(rows[0]["json_col"], '{"a":1}')
+        self.assertEqual(rows[0]["list_col"], "[1,2]")
 
-    def test_maintenance_action_timeout_raises(self):
-        original = cli.run_maintenance_action
+    def test_status_id_filter_helpers(self):
+        values = _status_id_filter_values(["b", "a"])
 
-        def slow_action(_args, _action, _target_uri):
-            time.sleep(2)
-            return "done"
+        self.assertEqual(values, ["1#a", "1#b", "3#a", "3#b"])
+        self.assertEqual(_lance_in_filter("__status_id", values), "__status_id IN ('1#a', '1#b', '3#a', '3#b')")
 
-        cli.run_maintenance_action = slow_action
-        try:
-            args = Namespace(maintenance_action_timeout_seconds=1, maintenance_action_kill_grace_seconds=0)
-            with self.assertRaises(TimeoutError):
-                run_maintenance_action_with_timeout(args, "optimize_indices", "s3://bucket/table.lance")
-        finally:
-            cli.run_maintenance_action = original
+    def test_decode_json_string_literal_only_decodes_string_literals(self):
+        self.assertEqual(decode_json_string_literal('"abc"'), "abc")
+        self.assertEqual(decode_json_string_literal('{"a":1}'), '{"a":1}')
+        self.assertEqual(decode_json_string_literal("abc"), "abc")
+        self.assertEqual(decode_json_string_literal('"unterminated'), '"unterminated')
 
-    def test_maintenance_action_timeout_disabled_runs_inline(self):
-        original = cli.run_maintenance_action
-        cli.run_maintenance_action = lambda _args, _action, _target_uri: "done"
-        try:
-            args = Namespace(maintenance_action_timeout_seconds=0, maintenance_action_kill_grace_seconds=0)
-            self.assertEqual(run_maintenance_action_with_timeout(args, "optimize_indices", "s3://bucket/table.lance"), "done")
-        finally:
-            cli.run_maintenance_action = original
+    def test_build_repair_quoted_json_strings_select_sql(self):
+        sql = build_repair_quoted_json_strings_select_sql(FakeRepairConn(), "'s3://bucket/tables/records.lance'", {"recordId"})
+
+        self.assertIn('"_id"', sql)
+        self.assertIn('CASE WHEN json_valid(CAST("recordId" AS VARCHAR))', sql)
+        self.assertIn("json_type(CAST(CAST(\"recordId\" AS VARCHAR) AS JSON)) = 'VARCHAR'", sql)
+        self.assertIn("json_extract_string(CAST(CAST(\"recordId\" AS VARCHAR) AS JSON), '$')", sql)
+        self.assertIn('AS "recordId"', sql)
+        self.assertIn('"payload"', sql)
+        self.assertTrue(sql.endswith("FROM 's3://bucket/tables/records.lance'"))
+
+    def test_validate_repair_columns_requires_string_columns(self):
+        import pyarrow as pa
+
+        dataset = FakeDataset(pa.schema([pa.field("recordId", pa.string()), pa.field("amount", pa.float64())]))
+
+        self.assertEqual(validate_repair_columns(dataset, ["recordId"], True), (["recordId"], []))
+        with self.assertRaisesRegex(RuntimeError, "missing"):
+            validate_repair_columns(dataset, ["missing"], True)
+        with self.assertRaisesRegex(RuntimeError, "non-string"):
+            validate_repair_columns(dataset, ["amount"], True)
+
+    def test_arrow_schema_signature_tracks_schema_shape(self):
+        import pyarrow as pa
+
+        signature = arrow_schema_signature(pa.schema([pa.field("recordId", pa.string(), nullable=True, metadata={b"k": b"v"})], metadata={b"schema": b"meta"}))
+
+        self.assertEqual(
+            signature,
+            {
+                "metadata": {"schema": "meta"},
+                "fields": [{"name": "recordId", "type": "string", "nullable": True, "metadata": {"k": "v"}}],
+            },
+        )
+
+    def test_schema_driven_repair_candidates_only_include_desired_strings(self):
+        table_schema = {
+            "type": "object",
+            "properties": {
+                "recordId": {"type": "string"},
+                "externalJson": {"type": "object", "properties": {"a": {"type": "string"}}},
+                "validatedResponse": {"anyOf": [{"type": "null"}, {"type": "string"}, {}]},
+                "amount": {"type": "number"},
+            },
+        }
+
+        self.assertEqual(desired_repair_columns_from_schema(table_schema), ["recordId"])
+
+    def test_physical_to_source_schema_map(self):
+        payload = {"schemas": {"Records": {"type": "object"}, "Record Work Items": {"type": "object"}}}
+
+        mapped = physical_to_source_schema_map(payload)
+
+        self.assertEqual(mapped["records"][0], "Records")
+        self.assertEqual(mapped["record_work_items"][0], "Record Work Items")
 
 
 if __name__ == "__main__":

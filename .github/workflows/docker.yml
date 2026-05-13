@@ -66,7 +66,7 @@ jobs:
       - name: Write image digest artifact
         if: github.event_name != 'pull_request'
         run: |
-          cat > convexlance-image.json <<JSON
+          cat > container-image.json <<JSON
           {
             "image": "${{ env.IMAGE_NAME }}",
             "digest": "${{ steps.build.outputs.digest }}",
@@ -75,16 +75,16 @@ jobs:
             "tags": ${{ toJSON(steps.meta.outputs.tags) }}
           }
           JSON
-          cat convexlance-image.json
-          echo "### Convex Lance image" >> "$GITHUB_STEP_SUMMARY"
+          cat container-image.json
+          echo "### Container image" >> "$GITHUB_STEP_SUMMARY"
           echo "\`${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload image digest artifact
         if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@v5
         with:
-          name: convexlance-image
-          path: convexlance-image.json
+          name: container-image
+          path: container-image.json
 
   infra-pr:
     name: Open infra digest PR
@@ -109,7 +109,7 @@ jobs:
         if: steps.token.outputs.configured == 'true'
         uses: actions/download-artifact@v5
         with:
-          name: convexlance-image
+          name: container-image
           path: image
 
       - name: Checkout infra repository
@@ -124,8 +124,8 @@ jobs:
         if: steps.token.outputs.configured == 'true'
         id: image
         run: |
-          REF="$(jq -r .ref image/convexlance-image.json)"
-          SOURCE_SHA="$(jq -r .source_sha image/convexlance-image.json)"
+          REF="$(jq -r .ref image/container-image.json)"
+          SOURCE_SHA="$(jq -r .source_sha image/container-image.json)"
           SHORT_SHA="${SOURCE_SHA:0:7}"
           python - <<'PY'
           import json
@@ -133,7 +133,7 @@ jobs:
           import re
           from pathlib import Path
 
-          image = json.loads(Path("image/convexlance-image.json").read_text())
+          image = json.loads(Path("image/container-image.json").read_text())
           path = Path("infra") / os.environ["INFRA_IMAGE_FILE"]
           text = path.read_text()
           updated, count = re.subn(
@@ -163,16 +163,16 @@ jobs:
           cd infra
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          BRANCH="chore/convexlance-image"
+          BRANCH="chore/container-image"
           git checkout -B "$BRANCH"
           git add "$INFRA_IMAGE_FILE"
           if git diff --cached --quiet; then
             echo "Infra already pins $IMAGE_REF." >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          git commit -m "Bump Convex Lance image to ${SHORT_SHA}"
+          git commit -m "Bump Container image to ${SHORT_SHA}"
           git push --force-with-lease origin "$BRANCH"
-          BODY="Updates \`container_image\` to the immutable Convex Lance image digest built from \`${SOURCE_SHA}\`.
+          BODY="Updates \`container_image\` to the immutable Container image digest built from \`${SOURCE_SHA}\`.
 
           Image:
           \`\`\`
@@ -181,7 +181,7 @@ jobs:
 
           Source workflow: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           if gh pr view "$BRANCH" --repo "$INFRA_REPOSITORY" >/dev/null 2>&1; then
-            gh pr edit "$BRANCH" --repo "$INFRA_REPOSITORY" --title "Bump Convex Lance image" --body "$BODY"
+            gh pr edit "$BRANCH" --repo "$INFRA_REPOSITORY" --title "Bump Container image" --body "$BODY"
           else
-            gh pr create --repo "$INFRA_REPOSITORY" --base main --head "$BRANCH" --title "Bump Convex Lance image" --body "$BODY"
+            gh pr create --repo "$INFRA_REPOSITORY" --base main --head "$BRANCH" --title "Bump Container image" --body "$BODY"
           fi

@@ -3,7 +3,7 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "convexlance"
+name = "sir-lance-convexlot"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
-convexlance = "convexlance.cli:main"
+sirlance = "convexlance.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

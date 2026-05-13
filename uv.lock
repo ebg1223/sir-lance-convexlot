@@ -79,27 +79,6 @@ crt = [
 ]
 
 [[package]]
-name = "convexlance"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "boto3" },
-    { name = "botocore", extra = ["crt"] },
-    { name = "duckdb" },
-    { name = "pyarrow" },
-    { name = "pylance" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "boto3", specifier = "==1.43.0" },
-    { name = "botocore", extras = ["crt"], specifier = "==1.43.0" },
-    { name = "duckdb", specifier = "==1.5.2" },
-    { name = "pyarrow", specifier = "==24.0.0" },
-    { name = "pylance", specifier = "==4.0.1" },
-]
-
-[[package]]
 name = "duckdb"
 version = "1.5.2"
 source = { registry = "https://pypi.org/simple" }
@@ -398,6 +377,27 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/9b/ec/7c692cde9125b77e84b307354d4fb705f98b8ccad59a036d5957ca75bfc3/s3transfer-0.17.0.tar.gz", hash = "sha256:9edeb6d1c3c2f89d6050348548834ad8289610d886e5bf7b7207728bd43ce33a", size = 155337, upload-time = "2026-04-29T22:07:36.33Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/87/72/c6c32d2b657fa3dad1de340254e14390b1e334ce38268b7ad51abda3c8c2/s3transfer-0.17.0-py3-none-any.whl", hash = "sha256:ce3801712acf4ad3e89fb9990df97b4972e93f4b3b0004d214be5bce12814c20", size = 86811, upload-time = "2026-04-29T22:07:34.966Z" },
+]
+
+[[package]]
+name = "sir-lance-convexlot"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "boto3" },
+    { name = "botocore", extra = ["crt"] },
+    { name = "duckdb" },
+    { name = "pyarrow" },
+    { name = "pylance" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "boto3", specifier = "==1.43.0" },
+    { name = "botocore", extras = ["crt"], specifier = "==1.43.0" },
+    { name = "duckdb", specifier = "==1.5.2" },
+    { name = "pyarrow", specifier = "==24.0.0" },
+    { name = "pylance", specifier = "==4.0.1" },
 ]
 
 [[package]]
