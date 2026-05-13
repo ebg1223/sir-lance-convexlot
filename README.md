@@ -1,7 +1,5 @@
 # Data Loader
 
-Pronounced roughly: **sir lance convex uhh lot**.
-
 Data Loader loads Convex document deltas and schemas into Lance datasets, with S3-backed state for cursors, locks, schema cache, table config state, audit records, and maintenance metadata.
 
 ## What it does
