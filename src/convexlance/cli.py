@@ -2413,7 +2413,7 @@ def run_create_indexes_parallel(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="sirlance", description="Data Loader")
+    parser = argparse.ArgumentParser(prog="sirlance", description="container loader")
     sub = parser.add_subparsers(dest="command", required=True)
 
     migrate = sub.add_parser("migrate-table")
