@@ -142,9 +142,9 @@ class BuildSelectSqlTest(unittest.TestCase):
 
         self.assertEqual(created, 3)
         self.assertEqual(skipped, [])
-        self.assertIn('CREATE INDEX records___id_ts_idx ON \'s3://bucket/tables/records.lance\' ("__id_ts") USING BTREE', conn.statements)
-        self.assertIn('CREATE INDEX records___status_id_idx ON \'s3://bucket/tables/records.lance\' ("__status_id") USING BTREE', conn.statements)
-        self.assertIn('CREATE INDEX records___status_idx ON \'s3://bucket/tables/records.lance\' ("__status") USING BITMAP', conn.statements)
+        self.assertIn("CREATE INDEX records___id_ts_idx ON 's3://bucket/tables/records.lance' (__id_ts) USING BTREE", conn.statements)
+        self.assertIn("CREATE INDEX records___status_id_idx ON 's3://bucket/tables/records.lance' (__status_id) USING BTREE", conn.statements)
+        self.assertIn("CREATE INDEX records___status_idx ON 's3://bucket/tables/records.lance' (__status) USING BITMAP", conn.statements)
 
     def test_table_config_filename_identifies_table_and_hash_versions(self):
         with tempfile.TemporaryDirectory() as tmp:

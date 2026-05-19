@@ -35,6 +35,12 @@ def quote_identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
 
 
+def lance_index_column_reference(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+        raise ValueError(f"Unsafe Lance index column reference: {value!r}")
+    return value
+
+
 def quote_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
@@ -1543,7 +1549,7 @@ def create_indexes_for_columns(conn: Any, table_name: str, table_ref: str, reque
         if column not in columns:
             skipped.append({"table": table_name, "column": column, "reason": "missing_column"})
             continue
-        statement = f"CREATE INDEX {spec.name or index_name(table_name, column)} ON {table_ref} ({quote_identifier(column)}) USING {index_type}"
+        statement = f"CREATE INDEX {spec.name or index_name(table_name, column)} ON {table_ref} ({lance_index_column_reference(column)}) USING {index_type}"
         try:
             conn.execute(statement)
             created += 1
@@ -1582,7 +1588,7 @@ def run_create_lance_indexes(args: argparse.Namespace) -> None:
                 requested_columns, config = requested_index_specs(args, table_name)
                 if args.dry_run:
                     for spec in requested_columns:
-                        print(f"CREATE INDEX {spec.name or index_name(table_name, spec.column)} ON {table_ref} ({quote_identifier(spec.column)}) USING {_validate_index_type(spec.index_type)};")
+                        print(f"CREATE INDEX {spec.name or index_name(table_name, spec.column)} ON {table_ref} ({lance_index_column_reference(spec.column)}) USING {_validate_index_type(spec.index_type)};")
                     indexes = len(requested_columns)
                 else:
                     indexes, table_skipped = create_indexes_for_columns(conn, table_name, table_ref, requested_columns)
