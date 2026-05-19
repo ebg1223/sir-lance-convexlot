@@ -138,14 +138,16 @@ jobs:
           image = json.loads(Path("image/container-image.json").read_text())
           path = Path("infra") / os.environ["INFRA_IMAGE_FILE"]
           text = path.read_text()
-          updated, count = re.subn(
+          patterns = [
               r'(variable "container_image" \{[\s\S]*?default\s*=\s*")[^"]+(")',
-              rf'\1{image["ref"]}\2',
-              text,
-              count=1,
-          )
-          if count != 1:
-              raise SystemExit("failed to update container_image default")
+              r'(variable "lance_incremental_image" \{[\s\S]*?default\s*=\s*")[^"]+(")',
+          ]
+          for pattern in patterns:
+              updated, count = re.subn(pattern, rf'\1{image["ref"]}\2', text, count=1)
+              if count == 1:
+                  break
+          else:
+              raise SystemExit("failed to update image variable default")
           path.write_text(updated)
           PY
           {
