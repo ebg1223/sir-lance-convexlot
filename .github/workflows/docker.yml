@@ -14,8 +14,6 @@ permissions:
 
 env:
   IMAGE_NAME: ghcr.io/${{ github.repository }}
-  INFRA_REPOSITORY: ${{ vars.INFRA_REPOSITORY }}
-  INFRA_IMAGE_FILE: ${{ vars.INFRA_IMAGE_FILE }}
 
 jobs:
   build:
@@ -93,36 +91,40 @@ jobs:
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
 
     steps:
-      - name: Check infra PR token
-        id: token
+      - name: Check infra PR configuration
+        id: infra
         env:
           TOKEN: ${{ secrets.INFRA_REPOSITORY_TOKEN }}
+          REPOSITORY: ${{ secrets.INFRA_REPOSITORY }}
+          IMAGE_FILE: ${{ secrets.INFRA_IMAGE_FILE }}
         run: |
-          if [ -n "$TOKEN" ]; then
+          if [ -n "$TOKEN" ] && [ -n "$REPOSITORY" ] && [ -n "$IMAGE_FILE" ]; then
             echo "configured=true" >> "$GITHUB_OUTPUT"
           else
             echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "Skipping infra PR because INFRA_REPOSITORY_TOKEN is not configured." >> "$GITHUB_STEP_SUMMARY"
+            echo "Skipping infra PR because one or more infra PR secrets are not configured." >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Download image digest artifact
-        if: steps.token.outputs.configured == 'true'
+        if: steps.infra.outputs.configured == 'true'
         uses: actions/download-artifact@v5
         with:
           name: container-image
           path: image
 
       - name: Checkout infra repository
-        if: steps.token.outputs.configured == 'true'
+        if: steps.infra.outputs.configured == 'true'
         uses: actions/checkout@v5
         with:
-          repository: ${{ env.INFRA_REPOSITORY }}
+          repository: ${{ secrets.INFRA_REPOSITORY }}
           token: ${{ secrets.INFRA_REPOSITORY_TOKEN }}
           path: infra
 
       - name: Update pinned image digest
-        if: steps.token.outputs.configured == 'true'
+        if: steps.infra.outputs.configured == 'true'
         id: image
+        env:
+          INFRA_IMAGE_FILE: ${{ secrets.INFRA_IMAGE_FILE }}
         run: |
           REF="$(jq -r .ref image/container-image.json)"
           SOURCE_SHA="$(jq -r .source_sha image/container-image.json)"
@@ -153,9 +155,11 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Create or update infra PR
-        if: steps.token.outputs.configured == 'true'
+        if: steps.infra.outputs.configured == 'true'
         env:
           GH_TOKEN: ${{ secrets.INFRA_REPOSITORY_TOKEN }}
+          INFRA_REPOSITORY: ${{ secrets.INFRA_REPOSITORY }}
+          INFRA_IMAGE_FILE: ${{ secrets.INFRA_IMAGE_FILE }}
           IMAGE_REF: ${{ steps.image.outputs.ref }}
           SOURCE_SHA: ${{ steps.image.outputs.source_sha }}
           SHORT_SHA: ${{ steps.image.outputs.short_sha }}
