@@ -895,7 +895,7 @@ def _add_lance_columns_native(dataset: Any, specs: list[ColumnSpec]) -> bool:
         return False
     import pyarrow as pa
 
-    fields = [pa.field(spec.name, _pa_type_for_column(spec), nullable=not spec.required) for spec in specs]
+    fields = [pa.field(spec.name, _pa_type_for_column(spec), nullable=True) for spec in specs]
     try:
         add_columns(pa.schema(fields))
     except TypeError:
@@ -1002,9 +1002,15 @@ def reconcile_lance_schema(args: argparse.Namespace, table_name: str, target_uri
             raise
         log_event("lance_incremental_schema_columns_altered", table=table_name, target_uri=target_uri, columns=[str(alteration["path"]) for alteration in alterations])
     if added:
-        if not _add_lance_columns_native(dataset, added):
-            log_event("lance_incremental_schema_add_columns_duckdb_fallback", table=table_name, target_uri=target_uri, columns=[spec.name for spec in added])
-            _add_lance_columns_duckdb(args, target_uri, added)
+        columns = [spec.name for spec in added]
+        log_event("lance_incremental_schema_columns_add_started", table=table_name, target_uri=target_uri, columns=columns)
+        try:
+            if not _add_lance_columns_native(dataset, added):
+                log_event("lance_incremental_schema_add_columns_duckdb_fallback", table=table_name, target_uri=target_uri, columns=columns)
+                _add_lance_columns_duckdb(args, target_uri, added)
+        except Exception as exc:  # noqa: BLE001
+            log_event("lance_incremental_schema_add_columns_failed", table=table_name, target_uri=target_uri, columns=columns, error=repr(exc))
+            raise
         log_event("lance_incremental_schema_columns_added", table=table_name, target_uri=target_uri, columns=[spec.name for spec in added])
     return specs
 

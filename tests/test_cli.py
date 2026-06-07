@@ -24,6 +24,7 @@ from convexlance.cli import (
     table_config_state_key,
     validate_repair_columns,
     write_applied_table_config_state,
+    _add_lance_columns_native,
     _lance_in_filter,
     _schema_type_alteration,
     _schema_types_compatible,
@@ -75,6 +76,14 @@ class FakeDataset:
         self.schema = schema
 
 
+class FakeAddColumnsDataset:
+    def __init__(self):
+        self.added_schema = None
+
+    def add_columns(self, schema):
+        self.added_schema = schema
+
+
 class FakeIndex:
     def __init__(self, name):
         self.name = name
@@ -113,6 +122,14 @@ class BuildSelectSqlTest(unittest.TestCase):
         self.assertIsNone(_schema_type_alteration(pa.int64(), pa.float64()))
         self.assertIsNone(_schema_type_alteration(pa.float64(), pa.string()))
         self.assertIsNone(_schema_type_alteration(pa.string(), pa.float64()))
+
+    def test_add_lance_columns_uses_nullable_fields(self):
+        dataset = FakeAddColumnsDataset()
+
+        self.assertTrue(_add_lance_columns_native(dataset, [ColumnSpec("recordId", "string", required=True)]))
+
+        self.assertIsNotNone(dataset.added_schema)
+        self.assertTrue(dataset.added_schema.field("recordId").nullable)
 
     def test_build_select_sql_generates_selected_columns(self):
         args = Namespace(
