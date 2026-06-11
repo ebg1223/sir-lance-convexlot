@@ -485,6 +485,8 @@ def infer_kind(schema: JsonMap) -> tuple[TypeKind, bool, TypeKind | None]:
         return "int64", nullable, None
     if t == "number":
         return "float64", nullable, None
+    if t == "null":
+        return "deferred", nullable, None
     if t == "array":
         item = _as_object(c.get("items"))
         if not item:
@@ -520,6 +522,8 @@ def schema_column_specs(table_schema: JsonMap) -> list[ColumnSpec]:
         if key in reserved or not isinstance(props[key], dict):
             continue
         kind, nullable, element_kind = infer_kind(props[key])
+        if kind == "deferred":
+            continue
         columns.append(ColumnSpec(key, kind, key in required and not nullable, element_kind))
     return columns
 

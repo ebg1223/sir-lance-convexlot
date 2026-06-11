@@ -21,6 +21,7 @@ from convexlance.cli import (
     read_applied_table_config_version,
     reconcile_table_config_for_dataset,
     requested_index_specs,
+    schema_column_specs,
     table_config_state_key,
     validate_repair_columns,
     write_applied_table_config_state,
@@ -264,6 +265,23 @@ class BuildSelectSqlTest(unittest.TestCase):
         self.assertEqual(infer_kind({"anyOf": [{"type": "boolean"}, {"type": "integer"}]}), ("int64", False, None))
         self.assertEqual(infer_kind({"type": "integer"}), ("int64", False, None))
         self.assertEqual(infer_kind({"type": "boolean"}), ("bool", False, None))
+
+    def test_infer_kind_bare_null_defers_column_materialization(self):
+        self.assertEqual(infer_kind({"type": "null"}), ("deferred", False, None))
+
+    def test_schema_column_specs_skip_deferred_null_fields(self):
+        specs = schema_column_specs(
+            {
+                "type": "object",
+                "properties": {
+                    "leaseExpiresAt": {"type": "null"},
+                    "processedCount": {"type": "number"},
+                },
+            },
+        )
+        names = {spec.name for spec in specs}
+        self.assertNotIn("leaseExpiresAt", names)
+        self.assertIn("processedCount", names)
 
     def test_normalize_rows_for_specs_preserves_scalar_strings(self):
         rows = normalize_rows_for_specs(
