@@ -384,6 +384,7 @@ class BuildSelectSqlTest(unittest.TestCase):
         schema = pa.schema([pa.field("_id", pa.string()), pa.field("_ts", pa.int64())])
 
         self.assertEqual(missing_lance_columns_for_rows([{"_id": "a", "_ts": 1, "newField": "x"}], schema), ["newField"])
+        self.assertEqual(missing_lance_columns_for_rows([{"_id": "a", "_ts": 1, "_component": "system"}], schema), [])
 
     def test_merge_guard_raises_before_unknown_columns_can_drop(self):
         import pyarrow as pa

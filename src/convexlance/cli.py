@@ -330,6 +330,7 @@ def open_lance_duckdb(args: argparse.Namespace) -> Any:
 
 
 GENERATED_COLUMNS = {"__status", "__status_id", "__id_ts"}
+DROPPABLE_DELTA_METADATA_COLUMNS = {"_component"}
 
 
 def status_expr() -> str:
@@ -806,7 +807,7 @@ def _coerce_rows_for_arrow_schema(rows: list[JsonMap], schema: Any) -> list[Json
 
 def missing_lance_columns_for_rows(rows: list[JsonMap], schema: Any) -> list[str]:
     field_names = {field.name for field in schema}
-    return sorted({column for row in rows for column in row if column not in field_names})
+    return sorted({column for row in rows for column in row if column not in field_names and column not in DROPPABLE_DELTA_METADATA_COLUMNS})
 
 
 def ensure_rows_fit_lance_schema(table_name: str, target_uri: str, rows: list[JsonMap], schema: Any) -> None:
