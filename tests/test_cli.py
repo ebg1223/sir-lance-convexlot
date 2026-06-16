@@ -402,11 +402,11 @@ class BuildSelectSqlTest(unittest.TestCase):
 
         def fake_reconcile(args, physical, target_uri, table_schema):
             calls.append((physical, target_uri, table_schema))
-            return []
+            return ["newField"]
 
         with (
             patch("convexlance.cli.list_lance_tables", return_value=["orphan", "records"]),
-            patch("convexlance.cli.reconcile_lance_schema", side_effect=fake_reconcile),
+            patch("convexlance.cli.reconcile_lance_append_only_columns", side_effect=fake_reconcile),
         ):
             result = reconcile_schema_payload_existing_lance_tables(args, "bucket", payload)
 
@@ -414,6 +414,7 @@ class BuildSelectSqlTest(unittest.TestCase):
         self.assertEqual(result["checked"], 1)
         self.assertEqual(result["reconciled"], 1)
         self.assertEqual(result["skipped"], 1)
+        self.assertEqual(result["columns_added"], 1)
         self.assertEqual(result["failed"], 0)
 
     def test_missing_columns_force_schema_refresh_before_retry(self):

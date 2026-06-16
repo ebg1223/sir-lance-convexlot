@@ -915,6 +915,27 @@ def table_schema_from_payload(schema_payload: JsonMap, source_table: str) -> Jso
     return table_schema if isinstance(table_schema, dict) else None
 
 
+def reconcile_lance_append_only_columns(args: argparse.Namespace, table_name: str, target_uri: str, table_schema: JsonMap) -> list[str]:
+    import lance
+
+    dataset = lance.dataset(target_uri)
+    existing = _dataset_column_types(dataset)
+    added = [spec for spec in schema_column_specs(table_schema) if spec.name not in existing]
+    if not added:
+        return []
+    columns = [spec.name for spec in added]
+    log_event("lance_incremental_schema_columns_add_started", table=table_name, target_uri=target_uri, columns=columns)
+    try:
+        if not _add_lance_columns_native(dataset, added):
+            log_event("lance_incremental_schema_add_columns_duckdb_fallback", table=table_name, target_uri=target_uri, columns=columns)
+            _add_lance_columns_duckdb(args, target_uri, added)
+    except Exception as exc:  # noqa: BLE001
+        log_event("lance_incremental_schema_add_columns_failed", table=table_name, target_uri=target_uri, columns=columns, error=repr(exc))
+        raise
+    log_event("lance_incremental_schema_columns_added", table=table_name, target_uri=target_uri, columns=columns)
+    return columns
+
+
 def reconcile_schema_payload_existing_lance_tables(args: argparse.Namespace, bucket: str, schema_payload: JsonMap) -> JsonMap:
     schema_by_physical = physical_to_source_schema_map(schema_payload)
     reconcile_args = argparse.Namespace(**vars(args))
@@ -933,7 +954,7 @@ def reconcile_schema_payload_existing_lance_tables(args: argparse.Namespace, buc
         failure = {"error": repr(exc)}
         log_event("lance_incremental_schema_refresh_reconcile_list_failed", **failure)
         return {"checked": 0, "reconciled": 0, "skipped": 0, "failed": 1, "failures": [failure]}
-    checked = reconciled = skipped = failed = 0
+    checked = reconciled = skipped = columns_added = failed = 0
     failures: list[JsonMap] = []
     log_event("lance_incremental_schema_refresh_reconcile_started", tables=len(existing_tables))
     for physical in existing_tables:
@@ -945,14 +966,14 @@ def reconcile_schema_payload_existing_lance_tables(args: argparse.Namespace, buc
         target_uri = lance_uri(bucket, args.lance_prefix, physical)
         checked += 1
         try:
-            reconcile_lance_schema(reconcile_args, physical, target_uri, table_schema)
+            columns_added += len(reconcile_lance_append_only_columns(reconcile_args, physical, target_uri, table_schema))
             reconciled += 1
         except Exception as exc:  # noqa: BLE001
             failed += 1
             failure = {"table": source_table, "physical_table": physical, "target_uri": target_uri, "error": repr(exc)}
             failures.append(failure)
             log_event("lance_incremental_schema_refresh_reconcile_failed", **failure)
-    result = {"checked": checked, "reconciled": reconciled, "skipped": skipped, "failed": failed}
+    result = {"checked": checked, "reconciled": reconciled, "skipped": skipped, "columns_added": columns_added, "failed": failed}
     log_event("lance_incremental_schema_refresh_reconcile_completed", **result)
     return {**result, "failures": failures}
 
