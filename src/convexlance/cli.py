@@ -27,6 +27,14 @@ class LeaseUnavailable(RuntimeError):
     pass
 
 
+class MissingLanceColumns(RuntimeError):
+    def __init__(self, table_name: str, target_uri: str, columns: list[str]) -> None:
+        self.table_name = table_name
+        self.target_uri = target_uri
+        self.columns = columns
+        super().__init__(f"Lance table {table_name} at {target_uri} is missing incoming row columns: {columns}")
+
+
 def log_event(event: str, **fields: Any) -> None:
     print(json.dumps({"event": event, "ts": int(time.time()), **fields}, sort_keys=True), flush=True)
 
@@ -796,6 +804,19 @@ def _coerce_rows_for_arrow_schema(rows: list[JsonMap], schema: Any) -> list[Json
     return coerced_rows
 
 
+def missing_lance_columns_for_rows(rows: list[JsonMap], schema: Any) -> list[str]:
+    field_names = {field.name for field in schema}
+    return sorted({column for row in rows for column in row if column not in field_names})
+
+
+def ensure_rows_fit_lance_schema(table_name: str, target_uri: str, rows: list[JsonMap], schema: Any) -> None:
+    missing = missing_lance_columns_for_rows(rows, schema)
+    if not missing:
+        return
+    log_event("lance_incremental_merge_missing_lance_columns", table=table_name, target_uri=target_uri, columns=missing)
+    raise MissingLanceColumns(table_name, target_uri, missing)
+
+
 def _pa_type_for_column(column: ColumnSpec) -> Any:
     import pyarrow as pa
 
@@ -869,14 +890,20 @@ def _schema_cache_stale(payload: JsonMap | None, ttl_seconds: int) -> bool:
     return time.time() - int(payload.get("fetched_at", 0)) >= ttl_seconds
 
 
-def incremental_schema_payload(state: S3JsonState, args: argparse.Namespace, client: ConvexClient) -> JsonMap:
-    payload = state.read(args.schema_key)
-    if _schema_cache_stale(payload, args.schema_refresh_seconds):
+def incremental_schema_payload_with_status(state: S3JsonState, args: argparse.Namespace, client: ConvexClient, force_refresh: bool = False) -> tuple[JsonMap, bool]:
+    payload = None if force_refresh else state.read(args.schema_key)
+    if force_refresh or _schema_cache_stale(payload, args.schema_refresh_seconds):
         schemas = client.json_schemas(delta_schema=True)
         payload = {"fetched_at": int(time.time()), "schemas": schemas}
         state.write(args.schema_key, payload)
         log_event("lance_incremental_schema_refreshed", tables=len([k for k, v in schemas.items() if isinstance(v, dict)]))
-    return payload or {"schemas": {}}
+        return payload, True
+    return payload or {"schemas": {}}, False
+
+
+def incremental_schema_payload(state: S3JsonState, args: argparse.Namespace, client: ConvexClient) -> JsonMap:
+    payload, _refreshed = incremental_schema_payload_with_status(state, args, client)
+    return payload
 
 
 def table_schema_from_payload(schema_payload: JsonMap, source_table: str) -> JsonMap | None:
@@ -885,6 +912,48 @@ def table_schema_from_payload(schema_payload: JsonMap, source_table: str) -> Jso
         return None
     table_schema = schemas.get(source_table)
     return table_schema if isinstance(table_schema, dict) else None
+
+
+def reconcile_schema_payload_existing_lance_tables(args: argparse.Namespace, bucket: str, schema_payload: JsonMap) -> JsonMap:
+    schema_by_physical = physical_to_source_schema_map(schema_payload)
+    reconcile_args = argparse.Namespace(**vars(args))
+    reconcile_args.unknown_table_policy = "skip"
+    try:
+        existing_tables = list_lance_tables(
+            argparse.Namespace(
+                tables=None,
+                tables_file=None,
+                lance_bucket=bucket,
+                lance_prefix=args.lance_prefix,
+                aws_region=args.aws_region,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        failure = {"error": repr(exc)}
+        log_event("lance_incremental_schema_refresh_reconcile_list_failed", **failure)
+        return {"checked": 0, "reconciled": 0, "skipped": 0, "failed": 1, "failures": [failure]}
+    checked = reconciled = skipped = failed = 0
+    failures: list[JsonMap] = []
+    log_event("lance_incremental_schema_refresh_reconcile_started", tables=len(existing_tables))
+    for physical in existing_tables:
+        schema_entry = schema_by_physical.get(physical)
+        if schema_entry is None:
+            skipped += 1
+            continue
+        source_table, table_schema = schema_entry
+        target_uri = lance_uri(bucket, args.lance_prefix, physical)
+        checked += 1
+        try:
+            reconcile_lance_schema(reconcile_args, physical, target_uri, table_schema)
+            reconciled += 1
+        except Exception as exc:  # noqa: BLE001
+            failed += 1
+            failure = {"table": source_table, "physical_table": physical, "target_uri": target_uri, "error": repr(exc)}
+            failures.append(failure)
+            log_event("lance_incremental_schema_refresh_reconcile_failed", **failure)
+    result = {"checked": checked, "reconciled": reconciled, "skipped": skipped, "failed": failed}
+    log_event("lance_incremental_schema_refresh_reconcile_completed", **result)
+    return {**result, "failures": failures}
 
 
 def _dataset_column_types(dataset: Any) -> dict[str, Any]:
@@ -1057,10 +1126,49 @@ def merge_incremental_rows(table_name: str, target_uri: str, rows: list[JsonMap]
     merge_rows = prepare_incremental_merge_rows(rows, existing_current)
     if specs is not None:
         merge_rows = normalize_rows_for_specs(merge_rows, specs)
+    ensure_rows_fit_lance_schema(table_name, target_uri, merge_rows, dataset.schema)
     merge_rows = _coerce_rows_for_arrow_schema(merge_rows, dataset.schema)
     merge_table = pa.Table.from_pylist(merge_rows, schema=dataset.schema)
     dataset.merge_insert("__id_ts").when_matched_update_all().when_not_matched_insert_all().execute(merge_table)
     return len(merge_rows)
+
+
+def merge_incremental_rows_with_schema_refresh(
+    args: argparse.Namespace,
+    state: S3JsonState,
+    client: ConvexClient,
+    schema_payload: JsonMap,
+    source_table: str,
+    physical: str,
+    target_uri: str,
+    rows: list[JsonMap],
+    specs: list[ColumnSpec] | None,
+) -> tuple[int, JsonMap]:
+    try:
+        return merge_incremental_rows(physical, target_uri, rows, specs), schema_payload
+    except MissingLanceColumns as exc:
+        if not args.reconcile_schema:
+            raise
+        log_event(
+            "lance_incremental_missing_columns_schema_refresh_started",
+            table=source_table,
+            physical_table=physical,
+            target_uri=target_uri,
+            columns=exc.columns,
+        )
+        refreshed_payload, _refreshed = incremental_schema_payload_with_status(state, args, client, force_refresh=True)
+        refreshed_specs = reconcile_lance_schema(args, physical, target_uri, table_schema_from_payload(refreshed_payload, source_table))
+        if refreshed_specs == []:
+            return 0, refreshed_payload
+        merged = merge_incremental_rows(physical, target_uri, rows, refreshed_specs)
+        log_event(
+            "lance_incremental_missing_columns_schema_refresh_completed",
+            table=source_table,
+            physical_table=physical,
+            target_uri=target_uri,
+            columns=exc.columns,
+        )
+        return merged, refreshed_payload
 
 
 def run_incremental_once(args: argparse.Namespace) -> JsonMap:
@@ -1074,7 +1182,12 @@ def run_incremental_once(args: argparse.Namespace) -> JsonMap:
     lease = acquire_lease(state, "incremental", args.lock_ttl_seconds, args.force)
     client = _convex_client(args)
     cursor, cursor_etag = _read_incremental_cursor(state, args)
-    schema_payload = incremental_schema_payload(state, args, client) if args.reconcile_schema else {"schemas": {}}
+    if args.reconcile_schema:
+        schema_payload, schema_refreshed = incremental_schema_payload_with_status(state, args, client)
+        if schema_refreshed and getattr(args, "reconcile_existing_tables_on_schema_refresh", True):
+            reconcile_schema_payload_existing_lance_tables(args, bucket, schema_payload)
+    else:
+        schema_payload = {"schemas": {}}
     start_cursor = cursor
     pages = rows_seen = rows_accepted = rows_merged = 0
     table_rows: dict[str, int] = {}
@@ -1104,7 +1217,17 @@ def run_incremental_once(args: argparse.Namespace) -> JsonMap:
                 if specs == []:
                     continue
                 config_result = reconcile_table_config_for_dataset(args, physical, target_uri) if args.table_config_indexes else None
-                merged = merge_incremental_rows(physical, target_uri, table_page_rows, specs)
+                merged, schema_payload = merge_incremental_rows_with_schema_refresh(
+                    args,
+                    state,
+                    client,
+                    schema_payload,
+                    source_table,
+                    physical,
+                    target_uri,
+                    table_page_rows,
+                    specs,
+                )
                 rows_merged += merged
                 page_rows_merged += merged
                 table_rows[source_table] = table_rows.get(source_table, 0) + merged
@@ -2475,6 +2598,11 @@ def build_parser() -> argparse.ArgumentParser:
     incremental.add_argument("--schema-key", default=os.environ.get("LANCE_INCREMENTAL_SCHEMA_KEY", "incremental/schema.json"))
     incremental.add_argument("--schema-refresh-seconds", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_SCHEMA_REFRESH_SECONDS", "600")))
     incremental.add_argument("--reconcile-schema", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_INCREMENTAL_RECONCILE_SCHEMA", "true").lower() not in {"0", "false", "no"})
+    incremental.add_argument(
+        "--reconcile-existing-tables-on-schema-refresh",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("LANCE_INCREMENTAL_RECONCILE_EXISTING_TABLES_ON_SCHEMA_REFRESH", "true").lower() not in {"0", "false", "no"},
+    )
     incremental.add_argument("--unknown-table-policy", choices=["fail", "create", "skip"], default=os.environ.get("LANCE_INCREMENTAL_UNKNOWN_TABLE_POLICY", "fail"))
     incremental.add_argument("--table-config-indexes", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_TABLE_CONFIG_INDEXES", "true").lower() not in {"0", "false", "no"})
     incremental.add_argument("--table-config-dir")
@@ -2506,6 +2634,11 @@ def build_parser() -> argparse.ArgumentParser:
     incremental_loop.add_argument("--schema-key", default=os.environ.get("LANCE_INCREMENTAL_SCHEMA_KEY", "incremental/schema.json"))
     incremental_loop.add_argument("--schema-refresh-seconds", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_SCHEMA_REFRESH_SECONDS", "600")))
     incremental_loop.add_argument("--reconcile-schema", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_INCREMENTAL_RECONCILE_SCHEMA", "true").lower() not in {"0", "false", "no"})
+    incremental_loop.add_argument(
+        "--reconcile-existing-tables-on-schema-refresh",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("LANCE_INCREMENTAL_RECONCILE_EXISTING_TABLES_ON_SCHEMA_REFRESH", "true").lower() not in {"0", "false", "no"},
+    )
     incremental_loop.add_argument("--unknown-table-policy", choices=["fail", "create", "skip"], default=os.environ.get("LANCE_INCREMENTAL_UNKNOWN_TABLE_POLICY", "fail"))
     incremental_loop.add_argument("--table-config-indexes", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_TABLE_CONFIG_INDEXES", "true").lower() not in {"0", "false", "no"})
     incremental_loop.add_argument("--table-config-dir")

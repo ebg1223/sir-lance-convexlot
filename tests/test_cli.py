@@ -1,9 +1,11 @@
 from argparse import Namespace
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from convexlance.cli import (
     ColumnSpec,
+    MissingLanceColumns,
     arrow_schema_signature,
     build_repair_quoted_json_strings_select_sql,
     build_select_sql,
@@ -15,9 +17,12 @@ from convexlance.cli import (
     generated_index_columns,
     infer_kind,
     load_table_config,
+    merge_incremental_rows_with_schema_refresh,
+    missing_lance_columns_for_rows,
     normalize_rows_for_specs,
     physical_to_source_schema_map,
     prepare_incremental_merge_rows,
+    reconcile_schema_payload_existing_lance_tables,
     read_applied_table_config_version,
     reconcile_table_config_for_dataset,
     requested_index_specs,
@@ -372,6 +377,73 @@ class BuildSelectSqlTest(unittest.TestCase):
 
         self.assertEqual(mapped["records"][0], "Records")
         self.assertEqual(mapped["record_work_items"][0], "Record Work Items")
+
+    def test_missing_lance_columns_for_rows_detects_projection_drops(self):
+        import pyarrow as pa
+
+        schema = pa.schema([pa.field("_id", pa.string()), pa.field("_ts", pa.int64())])
+
+        self.assertEqual(missing_lance_columns_for_rows([{"_id": "a", "_ts": 1, "newField": "x"}], schema), ["newField"])
+
+    def test_merge_guard_raises_before_unknown_columns_can_drop(self):
+        import pyarrow as pa
+        from convexlance.cli import ensure_rows_fit_lance_schema
+
+        schema = pa.schema([pa.field("_id", pa.string()), pa.field("_ts", pa.int64())])
+
+        with self.assertRaisesRegex(MissingLanceColumns, "newField"):
+            ensure_rows_fit_lance_schema("records", "s3://bucket/tables/records.lance", [{"_id": "a", "_ts": 1, "newField": "x"}], schema)
+
+    def test_schema_refresh_reconciles_existing_lance_tables_only(self):
+        payload = {"schemas": {"Records": {"type": "object"}, "Missing": {"type": "object"}}}
+        args = Namespace(lance_prefix="tables", aws_region="us-west-2")
+        calls = []
+
+        def fake_reconcile(args, physical, target_uri, table_schema):
+            calls.append((physical, target_uri, table_schema))
+            return []
+
+        with (
+            patch("convexlance.cli.list_lance_tables", return_value=["orphan", "records"]),
+            patch("convexlance.cli.reconcile_lance_schema", side_effect=fake_reconcile),
+        ):
+            result = reconcile_schema_payload_existing_lance_tables(args, "bucket", payload)
+
+        self.assertEqual(calls, [("records", "s3://bucket/tables/records.lance", {"type": "object"})])
+        self.assertEqual(result["checked"], 1)
+        self.assertEqual(result["reconciled"], 1)
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(result["failed"], 0)
+
+    def test_missing_columns_force_schema_refresh_before_retry(self):
+        args = Namespace(reconcile_schema=True)
+        stale_payload = {"schemas": {"Records": {"type": "object", "properties": {}}}}
+        fresh_schema = {"type": "object", "properties": {"newField": {"type": "string"}}}
+        fresh_payload = {"schemas": {"Records": fresh_schema}}
+        missing = MissingLanceColumns("records", "s3://bucket/tables/records.lance", ["newField"])
+
+        with (
+            patch("convexlance.cli.merge_incremental_rows", side_effect=[missing, 2]) as merge_rows,
+            patch("convexlance.cli.incremental_schema_payload_with_status", return_value=(fresh_payload, True)) as refresh,
+            patch("convexlance.cli.reconcile_lance_schema", return_value=[ColumnSpec("newField", "string")]) as reconcile,
+        ):
+            merged, payload = merge_incremental_rows_with_schema_refresh(
+                args,
+                FakeState(),
+                object(),
+                stale_payload,
+                "Records",
+                "records",
+                "s3://bucket/tables/records.lance",
+                [{"_id": "a", "_ts": 1, "newField": "x"}],
+                [],
+            )
+
+        self.assertEqual(merged, 2)
+        self.assertEqual(payload, fresh_payload)
+        self.assertEqual(merge_rows.call_count, 2)
+        refresh.assert_called_once()
+        reconcile.assert_called_once_with(args, "records", "s3://bucket/tables/records.lance", fresh_schema)
 
 
 if __name__ == "__main__":
