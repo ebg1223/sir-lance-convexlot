@@ -124,6 +124,21 @@ class FakeEmptyMergeDataset:
         return None
 
 
+class FakeSpillMergeDataset(FakeEmptyMergeDataset):
+    def __init__(self, schema):
+        super().__init__(schema)
+        self.deleted_predicate = None
+
+    def count_rows(self):
+        return 1
+
+    def execute(self, table):
+        raise OSError("LanceError(IO): Execution error: Spill has sent an error")
+
+    def delete(self, predicate):
+        self.deleted_predicate = predicate
+
+
 class FakeState:
     def __init__(self):
         self.values = {}
@@ -543,6 +558,34 @@ class BuildSelectSqlTest(unittest.TestCase):
         write_dataset.assert_called_once()
         self.assertEqual(write_dataset.call_args.kwargs["mode"], "append")
         self.assertFalse(dataset.merge_called)
+
+    def test_merge_incremental_rows_falls_back_to_delete_append_on_spill(self):
+        import pyarrow as pa
+
+        schema = pa.schema(
+            [
+                pa.field("_id", pa.string()),
+                pa.field("_ts", pa.int64()),
+                pa.field("_deleted", pa.bool_()),
+                pa.field("__status", pa.int8()),
+                pa.field("__status_id", pa.string()),
+                pa.field("__id_ts", pa.string()),
+                pa.field("value", pa.string()),
+            ],
+        )
+        dataset = FakeSpillMergeDataset(schema)
+
+        with (
+            patch("lance.dataset", return_value=dataset),
+            patch("lance.write_dataset") as write_dataset,
+            patch("convexlance.cli._existing_current_rows_native", return_value=[]),
+        ):
+            merged = merge_incremental_rows("records", "s3://bucket/tables/records.lance", [{"_id": "a", "_ts": 1, "_deleted": False, "value": "x"}])
+
+        self.assertEqual(merged, 1)
+        self.assertEqual(dataset.deleted_predicate, "__id_ts IN ('a#1')")
+        write_dataset.assert_called_once()
+        self.assertEqual(write_dataset.call_args.kwargs["mode"], "append")
 
 
 if __name__ == "__main__":

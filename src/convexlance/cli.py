@@ -1257,7 +1257,16 @@ def merge_incremental_rows(table_name: str, target_uri: str, rows: list[JsonMap]
         lance.write_dataset(merge_table, target_uri, mode="append")
         log_event("lance_incremental_empty_table_appended", table=table_name, target_uri=target_uri, rows=len(merge_rows))
         return len(merge_rows)
-    dataset.merge_insert("__id_ts").when_matched_update_all().when_not_matched_insert_all().execute(merge_table)
+    try:
+        dataset.merge_insert("__id_ts").when_matched_update_all().when_not_matched_insert_all().execute(merge_table)
+    except OSError as exc:
+        if "Spill has sent an error" not in str(exc):
+            raise
+        keys = sorted({str(row["__id_ts"]) for row in merge_rows if row.get("__id_ts") is not None})
+        if keys:
+            dataset.delete(_lance_in_filter("__id_ts", keys))
+        lance.write_dataset(merge_table, target_uri, mode="append")
+        log_event("lance_incremental_merge_spill_delete_append_fallback", table=table_name, target_uri=target_uri, rows=len(merge_rows), keys=len(keys))
     return len(merge_rows)
 
 
