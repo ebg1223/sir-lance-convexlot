@@ -1121,7 +1121,113 @@ def _recreate_dataset_with_new_schema(args: argparse.Namespace, table_name: str,
     log_event("lance_incremental_schema_recreated", table=table_name, target_uri=target_uri, columns=len(specs))
 
 
-def reconcile_lance_schema(args: argparse.Namespace, table_name: str, target_uri: str, table_schema: JsonMap | None) -> list[ColumnSpec] | None:
+def _coerce_scalar_to_kind(value: Any, kind: str) -> Any:
+    """Best-effort parse of a stored value into the desired column kind.
+
+    Unlike normalize_value_for_column (which only accepts already-typed JSON
+    values), this parses strings — e.g. "123" -> 123.0 for a float64 column —
+    and returns None when the value cannot be represented in the target type. It
+    is used to self-heal schema type drift by rewriting existing data in place.
+    """
+    if value is None:
+        return None
+    if kind in {"string", "json"}:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, separators=(",", ":"))
+        return str(value)
+    if kind == "bool":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in {"true", "t", "1", "yes"}:
+                return True
+            if text in {"false", "f", "0", "no"}:
+                return False
+        return None
+    if kind in {"int64", "int8"}:
+        if isinstance(value, bool):
+            return None
+        try:
+            if isinstance(value, str):
+                text = value.strip()
+                coerced = int(text) if text.lstrip("+-").isdigit() else int(float(text))
+            elif isinstance(value, float):
+                coerced = int(value)
+            elif isinstance(value, int):
+                coerced = value
+            else:
+                coerced = int(value)
+        except (ValueError, TypeError, OverflowError):
+            return None
+        low, high = (-128, 127) if kind == "int8" else (-(2**63), 2**63 - 1)
+        if not (low <= coerced <= high):
+            return None
+        return coerced
+    if kind == "float64":
+        if isinstance(value, bool):
+            return None
+        try:
+            return float(value)
+        except (ValueError, TypeError, OverflowError):
+            return None
+    if kind == "array":
+        return value if isinstance(value, list) else None
+    return value
+
+
+def _coerce_drift_columns(table_name: str, target_uri: str, specs: list[ColumnSpec], drift: list[JsonMap]) -> None:
+    """Rewrite drifted columns into their desired type in place.
+
+    Non-drift columns are preserved exactly; each drifted column is parsed
+    element-wise into the target type, with unparseable values becoming null.
+    The dataset is overwritten as a new Lance version, so the prior version
+    remains for time-travel/rollback until version cleanup. Raises rather than
+    silently destroying a column that has no castable values.
+    """
+    import lance
+    import pyarrow as pa
+
+    spec_by_name = {spec.name: spec for spec in specs}
+    drift_columns = [d["column"] for d in drift if d["column"] in spec_by_name]
+    if not drift_columns:
+        return
+    dataset = lance.dataset(target_uri)
+    table = dataset.to_table()
+    before_rows = table.num_rows
+    stats: dict[str, JsonMap] = {}
+    destroyed: list[str] = []
+    for name in drift_columns:
+        spec = spec_by_name[name]
+        original = table.column(name).to_pylist()
+        coerced = [_coerce_scalar_to_kind(value, spec.kind) for value in original]
+        before_non_null = sum(1 for value in original if value is not None)
+        after_non_null = sum(1 for value in coerced if value is not None)
+        stats[name] = {
+            "kind": spec.kind,
+            "before_non_null": before_non_null,
+            "after_non_null": after_non_null,
+            "newly_nulled": before_non_null - after_non_null,
+        }
+        if before_non_null > 0 and after_non_null == 0:
+            destroyed.append(name)
+        new_array = pa.array(coerced, type=_pa_type_for_column(spec))
+        index = table.schema.get_field_index(name)
+        table = table.set_column(index, pa.field(name, new_array.type, nullable=True), new_array)
+    if destroyed:
+        log_event("lance_incremental_schema_drift_coercion_would_destroy_column", table=table_name, target_uri=target_uri, columns=destroyed, stats=stats)
+        raise RuntimeError(f"Refusing to coerce {table_name}: columns {destroyed} have no values castable to the desired type; needs manual migration")
+    if table.num_rows != before_rows:
+        raise RuntimeError(f"Coercion row-count mismatch for {table_name}: before={before_rows} after={table.num_rows}")
+    lance.write_dataset(table, target_uri, mode="overwrite")
+    log_event("lance_incremental_schema_drift_coerced", table=table_name, target_uri=target_uri, columns=drift_columns, rows=before_rows, stats=stats)
+
+
+def reconcile_lance_schema(args: argparse.Namespace, table_name: str, target_uri: str, table_schema: JsonMap | None, _coerce_attempted: bool = False) -> list[ColumnSpec] | None:
     if table_schema is None:
         if args.unknown_table_policy == "fail":
             raise RuntimeError(f"Schema missing for incremental table {table_name}; refusing to merge without Convex schema")
@@ -1182,26 +1288,30 @@ def reconcile_lance_schema(args: argparse.Namespace, table_name: str, target_uri
         if args.auto_recreate_empty_schema_drift:
             table_empty = _table_is_empty(dataset)
             columns_with_data = [d["column"] for d in drift if _column_has_data(dataset, d["column"])]
-            
+
             if table_empty:
                 # Entire table is empty, safe to recreate with new schema
                 log_event("lance_incremental_schema_drift_table_empty", table=table_name, target_uri=target_uri, drift=drift)
                 _recreate_dataset_with_new_schema(args, table_name, target_uri, specs)
                 return specs
-            elif not columns_with_data:
+            if not columns_with_data:
                 # Only affected columns are empty, safe to recreate with new schema
                 log_event("lance_incremental_schema_drift_columns_empty", table=table_name, target_uri=target_uri, drift=drift)
                 _recreate_dataset_with_new_schema(args, table_name, target_uri, specs)
                 return specs
-            else:
-                # Some affected columns have data, need manual intervention
-                drift_with_data = [d for d in drift if d["column"] in columns_with_data]
-                log_event("lance_incremental_schema_type_drift", table=table_name, target_uri=target_uri, drift=drift_with_data)
-                raise RuntimeError(f"Lance schema type drift for {table_name}; run a controlled DuckDB rewrite before incremental merge: {drift_with_data}")
+            drift_with_data = [d for d in drift if d["column"] in columns_with_data]
         else:
-            # Auto-recreate disabled, fail as before
-            log_event("lance_incremental_schema_type_drift", table=table_name, target_uri=target_uri, drift=drift)
-            raise RuntimeError(f"Lance schema type drift for {table_name}; run a controlled DuckDB rewrite before incremental merge: {drift}")
+            drift_with_data = drift
+        # Best-effort self-heal: coerce the drifted columns into the desired type
+        # (parse where possible, null otherwise), then re-reconcile so any pending
+        # column adds / safe widenings are still applied. Guarded against re-entry
+        # so a coercion that fails to resolve the drift raises instead of looping.
+        if getattr(args, "coerce_schema_type_drift", True) and not _coerce_attempted:
+            log_event("lance_incremental_schema_drift_coercion_started", table=table_name, target_uri=target_uri, drift=drift_with_data)
+            _coerce_drift_columns(table_name, target_uri, specs, drift_with_data)
+            return reconcile_lance_schema(args, table_name, target_uri, table_schema, _coerce_attempted=True)
+        log_event("lance_incremental_schema_type_drift", table=table_name, target_uri=target_uri, drift=drift_with_data)
+        raise RuntimeError(f"Lance schema type drift for {table_name}; run a controlled DuckDB rewrite before incremental merge: {drift_with_data}")
     if alterations:
         try:
             dataset.alter_columns(*alterations)
@@ -2776,6 +2886,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     incremental.add_argument("--unknown-table-policy", choices=["fail", "create", "skip"], default=os.environ.get("LANCE_INCREMENTAL_UNKNOWN_TABLE_POLICY", "fail"))
     incremental.add_argument("--auto-recreate-empty-schema-drift", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_INCREMENTAL_AUTO_RECREATE_EMPTY_SCHEMA_DRIFT", "true").lower() not in {"0", "false", "no"})
+    incremental.add_argument("--coerce-schema-type-drift", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_INCREMENTAL_COERCE_SCHEMA_TYPE_DRIFT", "true").lower() not in {"0", "false", "no"})
     incremental.add_argument("--table-config-indexes", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_TABLE_CONFIG_INDEXES", "true").lower() not in {"0", "false", "no"})
     incremental.add_argument("--table-config-dir")
     incremental.add_argument("--table-config-bucket")
@@ -2813,6 +2924,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     incremental_loop.add_argument("--unknown-table-policy", choices=["fail", "create", "skip"], default=os.environ.get("LANCE_INCREMENTAL_UNKNOWN_TABLE_POLICY", "fail"))
     incremental_loop.add_argument("--auto-recreate-empty-schema-drift", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_INCREMENTAL_AUTO_RECREATE_EMPTY_SCHEMA_DRIFT", "true").lower() not in {"0", "false", "no"})
+    incremental_loop.add_argument("--coerce-schema-type-drift", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_INCREMENTAL_COERCE_SCHEMA_TYPE_DRIFT", "true").lower() not in {"0", "false", "no"})
     incremental_loop.add_argument("--table-config-indexes", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_TABLE_CONFIG_INDEXES", "true").lower() not in {"0", "false", "no"})
     incremental_loop.add_argument("--table-config-dir")
     incremental_loop.add_argument("--table-config-bucket")

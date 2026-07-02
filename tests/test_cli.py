@@ -33,6 +33,8 @@ from convexlance.cli import (
     validate_repair_columns,
     write_applied_table_config_state,
     _add_lance_columns_native,
+    _coerce_drift_columns,
+    _coerce_scalar_to_kind,
     _lance_in_filter,
     _schema_type_alteration,
     _schema_types_compatible,
@@ -652,6 +654,149 @@ class BuildSelectSqlTest(unittest.TestCase):
         self.assertIn("_deleted", str(ctx.exception))
         write_dataset.assert_not_called()
         self.assertIsNone(dataset.deleted_predicate)
+
+
+class SchemaDriftCoercionTest(unittest.TestCase):
+    def test_coerce_scalar_to_kind_parses_or_nulls(self):
+        # float64: parse numeric strings, null the unparseable, reject bools
+        self.assertEqual(_coerce_scalar_to_kind("123456789", "float64"), 123456789.0)
+        self.assertEqual(_coerce_scalar_to_kind("1.5", "float64"), 1.5)
+        self.assertEqual(_coerce_scalar_to_kind(7, "float64"), 7.0)
+        self.assertIsNone(_coerce_scalar_to_kind("N/A", "float64"))
+        self.assertIsNone(_coerce_scalar_to_kind(True, "float64"))
+        self.assertIsNone(_coerce_scalar_to_kind(None, "float64"))
+        # int kinds: truncate float strings, enforce int8 range
+        self.assertEqual(_coerce_scalar_to_kind("42", "int64"), 42)
+        self.assertEqual(_coerce_scalar_to_kind("42.9", "int64"), 42)
+        self.assertIsNone(_coerce_scalar_to_kind("200", "int8"))
+        self.assertEqual(_coerce_scalar_to_kind("100", "int8"), 100)
+        self.assertIsNone(_coerce_scalar_to_kind("99999999999999999999999", "int64"))
+        # bool: parse common truthy/falsey strings
+        self.assertIs(_coerce_scalar_to_kind("true", "bool"), True)
+        self.assertIs(_coerce_scalar_to_kind("0", "bool"), False)
+        self.assertIsNone(_coerce_scalar_to_kind("maybe", "bool"))
+        # string/json: stringify non-strings, JSON-encode containers
+        self.assertEqual(_coerce_scalar_to_kind(123, "string"), "123")
+        self.assertEqual(_coerce_scalar_to_kind({"a": 1}, "json"), '{"a":1}')
+
+    def _write_table(self, uri, rows, schema):
+        import lance
+        import pyarrow as pa
+
+        lance.write_dataset(pa.Table.from_pylist(rows, schema=schema), uri, mode="create")
+
+    def test_coerce_drift_columns_rewrites_string_to_double(self):
+        import lance
+        import pyarrow as pa
+
+        schema = pa.schema(
+            [
+                pa.field("_id", pa.string(), nullable=False),
+                pa.field("claimMdId", pa.string()),
+                pa.field("note", pa.string()),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            uri = f"{tmp}/claimmdsubmissionclaims.lance"
+            self._write_table(
+                uri,
+                [
+                    {"_id": "a", "claimMdId": "123456789", "note": "keep-a"},
+                    {"_id": "b", "claimMdId": "not-a-number", "note": "keep-b"},
+                    {"_id": "c", "claimMdId": None, "note": "keep-c"},
+                ],
+                schema,
+            )
+            specs = [
+                ColumnSpec("_id", "string", required=True),
+                ColumnSpec("claimMdId", "float64"),
+                ColumnSpec("note", "string"),
+            ]
+            drift = [{"column": "claimMdId", "existing": "string", "desired": "double", "reason": "duckdb_rewrite_required"}]
+
+            _coerce_drift_columns("claimmdsubmissionclaims", uri, specs, drift)
+
+            ds = lance.dataset(uri)
+            self.assertEqual(ds.count_rows(), 3)
+            self.assertTrue(pa.types.is_floating(ds.schema.field("claimMdId").type))
+            rows = {r["_id"]: r for r in ds.to_table().to_pylist()}
+            self.assertEqual(rows["a"]["claimMdId"], 123456789.0)
+            self.assertIsNone(rows["b"]["claimMdId"])  # unparseable -> null
+            self.assertIsNone(rows["c"]["claimMdId"])
+            # non-drift column preserved exactly
+            self.assertEqual(rows["a"]["note"], "keep-a")
+            self.assertEqual(rows["b"]["note"], "keep-b")
+
+    def test_coerce_drift_columns_refuses_total_destruction(self):
+        import pyarrow as pa
+
+        schema = pa.schema([pa.field("_id", pa.string(), nullable=False), pa.field("code", pa.string())])
+        with tempfile.TemporaryDirectory() as tmp:
+            uri = f"{tmp}/records.lance"
+            self._write_table(uri, [{"_id": "a", "code": "xyz"}, {"_id": "b", "code": "pqr"}], schema)
+            specs = [ColumnSpec("_id", "string", required=True), ColumnSpec("code", "float64")]
+            drift = [{"column": "code", "existing": "string", "desired": "double", "reason": "duckdb_rewrite_required"}]
+
+            with self.assertRaises(RuntimeError) as ctx:
+                _coerce_drift_columns("records", uri, specs, drift)
+
+            self.assertIn("code", str(ctx.exception))
+
+    def test_reconcile_lance_schema_coerces_string_to_double_end_to_end(self):
+        import lance
+        import pyarrow as pa
+
+        schema = pa.schema(
+            [
+                pa.field("_id", pa.string(), nullable=False),
+                pa.field("claimMdId", pa.string()),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            uri = f"{tmp}/claimmdsubmissionclaims.lance"
+            self._write_table(uri, [{"_id": "a", "claimMdId": "42"}, {"_id": "b", "claimMdId": "bad"}], schema)
+            args = Namespace(
+                unknown_table_policy="fail",
+                auto_recreate_empty_schema_drift=True,
+                coerce_schema_type_drift=True,
+            )
+            table_schema = {
+                "type": "object",
+                "properties": {"claimMdId": {"type": "number"}},
+            }
+
+            specs = reconcile_lance_schema(args, "claimmdsubmissionclaims", uri, table_schema)
+
+            self.assertIn("claimMdId", [spec.name for spec in specs])
+            ds = lance.dataset(uri)
+            self.assertTrue(pa.types.is_floating(ds.schema.field("claimMdId").type))
+            rows = {r["_id"]: r for r in ds.to_table().to_pylist()}
+            self.assertEqual(rows["a"]["claimMdId"], 42.0)
+            self.assertIsNone(rows["b"]["claimMdId"])
+
+    def test_reconcile_lance_schema_can_disable_coercion(self):
+        import pyarrow as pa
+
+        schema = pa.schema(
+            [
+                pa.field("_id", pa.string(), nullable=False),
+                pa.field("claimMdId", pa.string()),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            uri = f"{tmp}/claimmdsubmissionclaims.lance"
+            self._write_table(uri, [{"_id": "a", "claimMdId": "42"}], schema)
+            args = Namespace(
+                unknown_table_policy="fail",
+                auto_recreate_empty_schema_drift=True,
+                coerce_schema_type_drift=False,
+            )
+            table_schema = {"type": "object", "properties": {"claimMdId": {"type": "number"}}}
+
+            with self.assertRaises(RuntimeError) as ctx:
+                reconcile_lance_schema(args, "claimmdsubmissionclaims", uri, table_schema)
+
+            self.assertIn("claimMdId", str(ctx.exception))
 
 
 if __name__ == "__main__":
