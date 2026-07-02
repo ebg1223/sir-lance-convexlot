@@ -177,7 +177,11 @@ jobs:
             exit 0
           fi
           git commit -m "Bump Container image to ${SHORT_SHA}"
-          git push --force-with-lease origin "$BRANCH"
+          # The infra checkout only fetches the default branch, so the
+          # origin/$BRANCH tracking ref needed for --force-with-lease is absent
+          # and the lease is rejected as "stale info". This branch is bot-owned
+          # and recreated from main each run, so a plain force push is safe.
+          git push --force origin "$BRANCH"
           BODY="Updates \`container_image\` to the immutable Container image digest built from \`${SOURCE_SHA}\`.
 
           Image:
