@@ -1538,6 +1538,19 @@ def run_incremental_once(args: argparse.Namespace) -> JsonMap:
         release_lease(state, lease)
 
 
+def _incremental_pass_hit_page_cap(args: argparse.Namespace, stats: JsonMap | None) -> bool:
+    """True when the last pass processed a full page batch, i.e. backlog remains.
+
+    Used to drain aggressively while behind: a capped pass means there are more
+    deltas waiting, so the loop should start the next pass immediately instead of
+    idling for sleep_seconds.
+    """
+    cap = getattr(args, "max_pages_per_sync", None)
+    if not cap:
+        return False
+    return int((stats or {}).get("pages", 0)) >= int(cap)
+
+
 def run_incremental_loop(args: argparse.Namespace) -> None:
     touched_tables: set[str] = set()
     pages_since_optimize = 0
@@ -1545,6 +1558,7 @@ def run_incremental_loop(args: argparse.Namespace) -> None:
     last_optimized_at = time.time()
     while True:
         optimized = False
+        stats: JsonMap = {}
         try:
             stats = run_incremental_once(args)
             touched_tables.update(str(table) for table in stats.get("tables", []))
@@ -1560,7 +1574,10 @@ def run_incremental_loop(args: argparse.Namespace) -> None:
                 optimized = run_idle_maintenance_once(args, _incremental_state(args))
         except LeaseUnavailable as exc:
             log_event("lance_incremental_lock_unavailable", error=str(exc))
-        if not optimized:
+        # Skip the idle sleep while draining a backlog: if the pass hit the page
+        # cap there is more waiting, so start the next pass immediately. Only
+        # sleep once caught up (or when index optimization already ran).
+        if not optimized and not _incremental_pass_hit_page_cap(args, stats):
             time.sleep(args.sleep_seconds)
 
 

@@ -35,6 +35,7 @@ from convexlance.cli import (
     _add_lance_columns_native,
     _coerce_drift_columns,
     _coerce_scalar_to_kind,
+    _incremental_pass_hit_page_cap,
     _lance_in_filter,
     _schema_type_alteration,
     _schema_types_compatible,
@@ -797,6 +798,24 @@ class SchemaDriftCoercionTest(unittest.TestCase):
                 reconcile_lance_schema(args, "claimmdsubmissionclaims", uri, table_schema)
 
             self.assertIn("claimMdId", str(ctx.exception))
+
+
+class IncrementalLoopThrottleTest(unittest.TestCase):
+    def test_hit_page_cap_signals_backlog(self):
+        args = Namespace(max_pages_per_sync=100)
+        # Full batch -> backlog remains -> skip the idle sleep.
+        self.assertTrue(_incremental_pass_hit_page_cap(args, {"pages": 100}))
+        self.assertTrue(_incremental_pass_hit_page_cap(args, {"pages": 137}))
+        # Partial batch -> caught up -> sleep.
+        self.assertFalse(_incremental_pass_hit_page_cap(args, {"pages": 42}))
+        self.assertFalse(_incremental_pass_hit_page_cap(args, {"pages": 0}))
+        # No stats (e.g. lease unavailable) -> sleep/back off.
+        self.assertFalse(_incremental_pass_hit_page_cap(args, {}))
+        self.assertFalse(_incremental_pass_hit_page_cap(args, None))
+
+    def test_no_page_cap_configured_always_sleeps(self):
+        self.assertFalse(_incremental_pass_hit_page_cap(Namespace(max_pages_per_sync=0), {"pages": 500}))
+        self.assertFalse(_incremental_pass_hit_page_cap(Namespace(max_pages_per_sync=None), {"pages": 500}))
 
 
 if __name__ == "__main__":
