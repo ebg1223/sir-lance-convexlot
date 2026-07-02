@@ -1345,17 +1345,30 @@ def run_incremental_once(args: argparse.Namespace) -> JsonMap:
                 if specs == []:
                     continue
                 config_result = reconcile_table_config_for_dataset(args, physical, target_uri) if args.table_config_indexes else None
-                merged, schema_payload = merge_incremental_rows_with_schema_refresh(
-                    args,
-                    state,
-                    client,
-                    schema_payload,
-                    source_table,
-                    physical,
-                    target_uri,
-                    table_page_rows,
-                    specs,
-                )
+                try:
+                    merged, schema_payload = merge_incremental_rows_with_schema_refresh(
+                        args,
+                        state,
+                        client,
+                        schema_payload,
+                        source_table,
+                        physical,
+                        target_uri,
+                        table_page_rows,
+                        specs,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log_event(
+                        "lance_incremental_table_merge_failed",
+                        table=source_table,
+                        physical_table=physical,
+                        target_uri=target_uri,
+                        rows=len(table_page_rows),
+                        cursor=page_cursor,
+                        page=pages,
+                        error=repr(exc),
+                    )
+                    raise
                 rows_merged += merged
                 page_rows_merged += merged
                 table_rows[source_table] = table_rows.get(source_table, 0) + merged
