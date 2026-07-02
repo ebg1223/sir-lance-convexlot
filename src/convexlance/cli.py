@@ -1035,6 +1035,62 @@ def create_indexes_for_dataset(dataset: Any, table_name: str, requested_columns:
     return created, skipped
 
 
+def _column_has_data(dataset: Any, column_name: str) -> bool:
+    """Check if a column has any non-null values in the dataset."""
+    try:
+        table = dataset.to_table(columns=[column_name])
+        if table.num_rows == 0:
+            return False
+        # Check for non-null values
+        column = table.column(column_name)
+        for i in range(column.num_rows):
+            if not column.is_null(i):
+                return True
+        return False
+    except Exception:  # noqa: BLE001
+        # If we can't check, assume it has data to be safe
+        return True
+
+
+def _table_is_empty(dataset: Any) -> bool:
+    """Check if the entire dataset table is empty."""
+    try:
+        return dataset.to_table().num_rows == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _recreate_dataset_with_new_schema(args: argparse.Namespace, table_name: str, target_uri: str, specs: list[ColumnSpec]) -> None:
+    """Recreate a dataset with a new schema when the existing one is empty or has empty columns."""
+    import lance
+    import pyarrow as pa
+    import boto3
+
+    # Delete the existing dataset
+    try:
+        # Lance datasets are directories, so we need to remove them
+        # Parse S3 URI
+        if target_uri.startswith('s3://'):
+            uri_parts = target_uri[5:].split('/', 1)
+            bucket = uri_parts[0]
+            prefix = uri_parts[1] if len(uri_parts) > 1 else ''
+            # List and delete all objects in the dataset directory
+            s3 = boto3.client('s3')
+            paginator = s3.get_paginator('list_objects_v2')
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                if 'Contents' in page:
+                    objects = [{'Key': obj['Key']} for obj in page['Contents']]
+                    if objects:
+                        s3.delete_objects(Bucket=bucket, Delete={'Objects': objects})
+    except Exception as exc:  # noqa: BLE001
+        log_event("lance_incremental_schema_recreate_delete_failed", table=table_name, target_uri=target_uri, error=repr(exc))
+
+    # Create new dataset with correct schema
+    empty = pa.Table.from_pylist([], schema=_arrow_schema_for_specs(specs))
+    lance.write_dataset(empty, target_uri, mode='create')
+    log_event("lance_incremental_schema_recreated", table=table_name, target_uri=target_uri, columns=len(specs))
+
+
 def reconcile_lance_schema(args: argparse.Namespace, table_name: str, target_uri: str, table_schema: JsonMap | None) -> list[ColumnSpec] | None:
     if table_schema is None:
         if args.unknown_table_policy == "fail":
@@ -1086,8 +1142,30 @@ def reconcile_lance_schema(args: argparse.Namespace, table_name: str, target_uri
             continue
         added.append(spec)
     if drift:
-        log_event("lance_incremental_schema_type_drift", table=table_name, target_uri=target_uri, drift=drift)
-        raise RuntimeError(f"Lance schema type drift for {table_name}; run a controlled DuckDB rewrite before incremental merge: {drift}")
+        # Check if we can safely handle the drift by checking if affected columns are empty
+        if args.auto_recreate_empty_schema_drift:
+            table_empty = _table_is_empty(dataset)
+            columns_with_data = [d["column"] for d in drift if _column_has_data(dataset, d["column"])]
+            
+            if table_empty:
+                # Entire table is empty, safe to recreate with new schema
+                log_event("lance_incremental_schema_drift_table_empty", table=table_name, target_uri=target_uri, drift=drift)
+                _recreate_dataset_with_new_schema(args, table_name, target_uri, specs)
+                return specs
+            elif not columns_with_data:
+                # Only affected columns are empty, safe to recreate with new schema
+                log_event("lance_incremental_schema_drift_columns_empty", table=table_name, target_uri=target_uri, drift=drift)
+                _recreate_dataset_with_new_schema(args, table_name, target_uri, specs)
+                return specs
+            else:
+                # Some affected columns have data, need manual intervention
+                drift_with_data = [d for d in drift if d["column"] in columns_with_data]
+                log_event("lance_incremental_schema_type_drift", table=table_name, target_uri=target_uri, drift=drift_with_data)
+                raise RuntimeError(f"Lance schema type drift for {table_name}; run a controlled DuckDB rewrite before incremental merge: {drift_with_data}")
+        else:
+            # Auto-recreate disabled, fail as before
+            log_event("lance_incremental_schema_type_drift", table=table_name, target_uri=target_uri, drift=drift)
+            raise RuntimeError(f"Lance schema type drift for {table_name}; run a controlled DuckDB rewrite before incremental merge: {drift}")
     if alterations:
         try:
             dataset.alter_columns(*alterations)
@@ -2626,6 +2704,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("LANCE_INCREMENTAL_RECONCILE_EXISTING_TABLES_ON_SCHEMA_REFRESH", "true").lower() not in {"0", "false", "no"},
     )
     incremental.add_argument("--unknown-table-policy", choices=["fail", "create", "skip"], default=os.environ.get("LANCE_INCREMENTAL_UNKNOWN_TABLE_POLICY", "fail"))
+    incremental.add_argument("--auto-recreate-empty-schema-drift", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_INCREMENTAL_AUTO_RECREATE_EMPTY_SCHEMA_DRIFT", "true").lower() not in {"0", "false", "no"})
     incremental.add_argument("--table-config-indexes", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_TABLE_CONFIG_INDEXES", "true").lower() not in {"0", "false", "no"})
     incremental.add_argument("--table-config-dir")
     incremental.add_argument("--table-config-bucket")
@@ -2662,6 +2741,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("LANCE_INCREMENTAL_RECONCILE_EXISTING_TABLES_ON_SCHEMA_REFRESH", "true").lower() not in {"0", "false", "no"},
     )
     incremental_loop.add_argument("--unknown-table-policy", choices=["fail", "create", "skip"], default=os.environ.get("LANCE_INCREMENTAL_UNKNOWN_TABLE_POLICY", "fail"))
+    incremental_loop.add_argument("--auto-recreate-empty-schema-drift", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_INCREMENTAL_AUTO_RECREATE_EMPTY_SCHEMA_DRIFT", "true").lower() not in {"0", "false", "no"})
     incremental_loop.add_argument("--table-config-indexes", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_TABLE_CONFIG_INDEXES", "true").lower() not in {"0", "false", "no"})
     incremental_loop.add_argument("--table-config-dir")
     incremental_loop.add_argument("--table-config-bucket")
