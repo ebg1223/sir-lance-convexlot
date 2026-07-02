@@ -307,6 +307,43 @@ class BuildSelectSqlTest(unittest.TestCase):
         self.assertEqual(by_version["b#50"]["__status_id"], "1#b")
         self.assertNotIn("_current", by_version["a#200"])
 
+    def test_prepare_incremental_merge_rows_materializes_deleted(self):
+        incoming = [
+            {"_id": "a", "_ts": 100, "value": "live"},
+            {"_id": "b", "_ts": 100, "_deleted": True},
+        ]
+
+        rows = prepare_incremental_merge_rows(incoming, [])
+        by_version = {row["__id_ts"]: row for row in rows}
+
+        self.assertIs(by_version["a#100"]["_deleted"], False)
+        self.assertIs(by_version["b#100"]["_deleted"], True)
+
+    def test_prepare_incremental_merge_rows_demotion_preserves_existing_payload(self):
+        incoming = [{"_id": "a", "_ts": 200, "value": "new"}]
+        existing = [
+            {
+                "_id": "a",
+                "_ts": 150,
+                "_deleted": None,
+                "value": "old",
+                "extra": 7,
+                "__id_ts": "a#150",
+                "__status": 1,
+                "__status_id": "1#a",
+            }
+        ]
+
+        rows = prepare_incremental_merge_rows(incoming, existing)
+        by_version = {row["__id_ts"]: row for row in rows}
+
+        demoted = by_version["a#150"]
+        self.assertEqual(demoted["value"], "old")
+        self.assertEqual(demoted["extra"], 7)
+        self.assertIs(demoted["_deleted"], False)
+        self.assertEqual(demoted["__status"], 0)
+        self.assertEqual(demoted["__status_id"], "0#a")
+
     def test_prepare_incremental_merge_rows_preserves_existing_current_for_older_delta(self):
         incoming = [{"_id": "a", "_ts": 100, "_deleted": False, "value": "old"}]
         existing = [{"_id": "a", "_ts": 150, "_deleted": False, "__id_ts": "a#150", "__status": 1, "__status_id": "1#a"}]
@@ -586,6 +623,35 @@ class BuildSelectSqlTest(unittest.TestCase):
         self.assertEqual(dataset.deleted_predicate, "__id_ts IN ('a#1')")
         write_dataset.assert_called_once()
         self.assertEqual(write_dataset.call_args.kwargs["mode"], "append")
+
+    def test_merge_incremental_rows_rejects_null_in_non_nullable_column(self):
+        import pyarrow as pa
+
+        schema = pa.schema(
+            [
+                pa.field("_id", pa.string(), nullable=False),
+                pa.field("_ts", pa.int64(), nullable=False),
+                pa.field("_deleted", pa.bool_(), nullable=False),
+                pa.field("__status", pa.int8(), nullable=False),
+                pa.field("__status_id", pa.string(), nullable=False),
+                pa.field("__id_ts", pa.string(), nullable=False),
+                pa.field("value", pa.string()),
+            ],
+        )
+        dataset = FakeSpillMergeDataset(schema)
+
+        with (
+            patch("lance.dataset", return_value=dataset),
+            patch("lance.write_dataset") as write_dataset,
+            patch("convexlance.cli._existing_current_rows_native", return_value=[]),
+            patch("convexlance.cli.prepare_incremental_merge_rows", side_effect=lambda rows, existing: [dict(row, _deleted=None, __status=1, __status_id="1#a", __id_ts="a#1") for row in rows]),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                merge_incremental_rows("records", "s3://bucket/tables/records.lance", [{"_id": "a", "_ts": 1, "value": "x"}])
+
+        self.assertIn("_deleted", str(ctx.exception))
+        write_dataset.assert_not_called()
+        self.assertIsNone(dataset.deleted_predicate)
 
 
 if __name__ == "__main__":

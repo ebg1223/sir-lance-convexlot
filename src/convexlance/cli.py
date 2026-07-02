@@ -577,6 +577,9 @@ def prepare_incremental_merge_rows(incoming_rows: list[JsonMap], existing_curren
         deleted = bool(row.get("_deleted", False))
         status = status_value(becomes_current, deleted)
         row.pop("_current", None)
+        # Convex deltas omit _deleted on live documents; the Lance column is
+        # non-nullable, so materialize the coalesced value on every row.
+        row["_deleted"] = deleted
         row["__status"] = status
         row["__status_id"] = status_id_value(status, row["_id"])
         row["__id_ts"] = id_ts_value(row)
@@ -585,11 +588,12 @@ def prepare_incremental_merge_rows(incoming_rows: list[JsonMap], existing_curren
         if becomes_current and existing_current is not None and id_ts_value(existing_current) != row["__id_ts"]:
             existing_version = id_ts_value(existing_current)
             if existing_version not in demoted_versions:
-                demoted = {
-                    "_id": existing_current["_id"],
-                    "_ts": existing_current["_ts"],
-                    "__id_ts": existing_version,
-                }
+                # merge_insert when_matched_update_all replaces every column of
+                # the matched row, so the demoted row must carry the full
+                # existing payload — a stub would null out the stored history.
+                demoted = dict(existing_current)
+                demoted["_deleted"] = bool(existing_current.get("_deleted", False))
+                demoted["__id_ts"] = existing_version
                 demoted_status = status_value(False, bool(existing_current.get("_deleted", False)))
                 demoted["__status"] = demoted_status
                 demoted["__status_id"] = status_id_value(demoted_status, existing_current["_id"])
@@ -818,6 +822,22 @@ def _coerce_rows_for_arrow_schema(rows: list[JsonMap], schema: Any) -> list[Json
 def missing_lance_columns_for_rows(rows: list[JsonMap], schema: Any) -> list[str]:
     field_names = {field.name for field in schema}
     return sorted({column for row in rows for column in row if column not in field_names and column not in DROPPABLE_DELTA_METADATA_COLUMNS})
+
+
+def ensure_required_columns_non_null(table_name: str, target_uri: str, rows: list[JsonMap], schema: Any) -> None:
+    non_nullable = [field.name for field in schema if not field.nullable]
+    for index, row in enumerate(rows):
+        for name in non_nullable:
+            if row.get(name) is None:
+                log_event(
+                    "lance_incremental_required_column_null",
+                    table=table_name,
+                    target_uri=target_uri,
+                    column=name,
+                    row_id=row.get("_id"),
+                    row_index=index,
+                )
+                raise RuntimeError(f"Lance merge for {table_name} produced null in non-nullable column {name!r} (row _id={row.get('_id')!r})")
 
 
 def ensure_rows_fit_lance_schema(table_name: str, target_uri: str, rows: list[JsonMap], schema: Any) -> None:
@@ -1244,6 +1264,7 @@ def merge_incremental_rows(table_name: str, target_uri: str, rows: list[JsonMap]
         merge_rows = normalize_rows_for_specs(merge_rows, specs)
     ensure_rows_fit_lance_schema(table_name, target_uri, merge_rows, dataset.schema)
     merge_rows = _coerce_rows_for_arrow_schema(merge_rows, dataset.schema)
+    ensure_required_columns_non_null(table_name, target_uri, merge_rows, dataset.schema)
     merge_table = pa.Table.from_pylist(merge_rows, schema=dataset.schema)
     try:
         row_count = dataset.count_rows()
