@@ -495,7 +495,14 @@ def infer_kind(schema: JsonMap) -> tuple[TypeKind, bool, TypeKind | None]:
     if t == "number":
         return "float64", nullable, None
     if t == "null":
-        return "deferred", nullable, None
+        # Convex delta schemas can contain fields whose current observed type is
+        # only null. The incremental stream still includes those keys with null
+        # values, so omitting the column from Lance makes later merges fail with
+        # MissingLanceColumns before the field ever has a concrete type. Create
+        # a nullable string placeholder instead; schema reconciliation can widen
+        # compatible string-like placeholders later, and incompatible concrete
+        # changes still route through the controlled drift path.
+        return "string", True, None
     if t == "array":
         item = _as_object(c.get("items"))
         if not item:
@@ -531,8 +538,6 @@ def schema_column_specs(table_schema: JsonMap) -> list[ColumnSpec]:
         if key in reserved or not isinstance(props[key], dict):
             continue
         kind, nullable, element_kind = infer_kind(props[key])
-        if kind == "deferred":
-            continue
         columns.append(ColumnSpec(key, kind, key in required and not nullable, element_kind))
     return columns
 

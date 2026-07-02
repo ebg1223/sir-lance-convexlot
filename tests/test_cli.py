@@ -271,10 +271,10 @@ class BuildSelectSqlTest(unittest.TestCase):
         self.assertEqual(infer_kind({"type": "integer"}), ("int64", False, None))
         self.assertEqual(infer_kind({"type": "boolean"}), ("bool", False, None))
 
-    def test_infer_kind_bare_null_defers_column_materialization(self):
-        self.assertEqual(infer_kind({"type": "null"}), ("deferred", False, None))
+    def test_infer_kind_bare_null_creates_nullable_string_placeholder(self):
+        self.assertEqual(infer_kind({"type": "null"}), ("string", True, None))
 
-    def test_schema_column_specs_skip_deferred_null_fields(self):
+    def test_schema_column_specs_materialize_null_fields_as_nullable_placeholders(self):
         specs = schema_column_specs(
             {
                 "type": "object",
@@ -284,9 +284,10 @@ class BuildSelectSqlTest(unittest.TestCase):
                 },
             },
         )
-        names = {spec.name for spec in specs}
-        self.assertNotIn("leaseExpiresAt", names)
-        self.assertIn("processedCount", names)
+        by_name = {spec.name: spec for spec in specs}
+        self.assertEqual(by_name["leaseExpiresAt"].kind, "string")
+        self.assertFalse(by_name["leaseExpiresAt"].required)
+        self.assertEqual(by_name["processedCount"].kind, "float64")
 
     def test_normalize_rows_for_specs_preserves_scalar_strings(self):
         rows = normalize_rows_for_specs(
