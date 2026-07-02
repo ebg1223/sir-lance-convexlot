@@ -1117,7 +1117,13 @@ def reconcile_lance_schema(args: argparse.Namespace, table_name: str, target_uri
         empty = pa.Table.from_pylist([], schema=_arrow_schema_for_specs(specs))
         lance.write_dataset(empty, target_uri, mode="create")
         dataset = lance.dataset(target_uri)
-        requested, config = requested_index_specs(args, table_name)
+        # Do not create generated scalar indexes before the first incremental
+        # upsert into a newly discovered table. Lance 4.0.x can fail
+        # merge_insert on S3-backed tables that have just been created with
+        # empty scalar indexes ("Spill has sent an error"). Let the row merge
+        # establish the table contents first; normal table-config/index
+        # reconciliation can add configured indexes later.
+        requested, config = requested_index_specs(argparse.Namespace(**vars(args), generated_indexes=False), table_name)
         generated_indexes, index_skipped = create_indexes_for_dataset(dataset, table_name, requested)
         write_applied_table_config_state(table_config_state(args), table_name, config, generated_indexes, index_skipped)
         log_event(

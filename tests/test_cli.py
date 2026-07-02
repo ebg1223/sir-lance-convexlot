@@ -22,6 +22,7 @@ from convexlance.cli import (
     normalize_rows_for_specs,
     physical_to_source_schema_map,
     prepare_incremental_merge_rows,
+    reconcile_lance_schema,
     reconcile_schema_payload_existing_lance_tables,
     read_applied_table_config_version,
     reconcile_table_config_for_dataset,
@@ -194,6 +195,37 @@ class BuildSelectSqlTest(unittest.TestCase):
 
         self.assertIsNotNone(config)
         self.assertEqual([(idx.column, idx.index_type) for idx in requested], [("__id_ts", "BTREE"), ("__status_id", "BTREE"), ("__status", "BITMAP"), ("id", "BTREE")])
+
+    def test_incremental_unknown_table_create_disables_generated_indexes(self):
+        args = Namespace(
+            unknown_table_policy="create",
+            table_config_indexes=True,
+            table_config_dir=None,
+            table_config_bucket=None,
+            table_config_prefix=None,
+            table_config_state_bucket=None,
+            table_config_state_prefix="state",
+            aws_region="us-west-2",
+        )
+        table_schema = {"type": "object", "properties": {"value": {"type": "string"}}}
+        requested_args = []
+
+        def fake_requested_index_specs(index_args, table_name):
+            requested_args.append((index_args, table_name))
+            return [], None
+
+        with (
+            patch("lance.dataset", side_effect=[RuntimeError("missing"), object()]),
+            patch("lance.write_dataset"),
+            patch("convexlance.cli.requested_index_specs", side_effect=fake_requested_index_specs),
+            patch("convexlance.cli.create_indexes_for_dataset", return_value=(0, [])),
+            patch("convexlance.cli.write_applied_table_config_state"),
+        ):
+            specs = reconcile_lance_schema(args, "records", "s3://bucket/tables/records.lance", table_schema)
+
+        self.assertIn("value", [spec.name for spec in specs])
+        self.assertEqual(requested_args[0][1], "records")
+        self.assertFalse(requested_args[0][0].generated_indexes)
 
     def test_dataset_index_names_detects_extra_indexes(self):
         desired = desired_index_names("records", generated_index_columns())
