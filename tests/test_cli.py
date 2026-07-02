@@ -18,6 +18,7 @@ from convexlance.cli import (
     infer_kind,
     load_table_config,
     merge_incremental_rows_with_schema_refresh,
+    merge_incremental_rows,
     missing_lance_columns_for_rows,
     normalize_rows_for_specs,
     physical_to_source_schema_map,
@@ -99,6 +100,28 @@ class FakeIndex:
 class FakeIndexDataset:
     def list_indices(self):
         return [FakeIndex("records___id_ts_idx"), {"name": "records_id_idx"}, "records_old_idx"]
+
+
+class FakeEmptyMergeDataset:
+    def __init__(self, schema):
+        self.schema = schema
+        self.merge_called = False
+
+    def count_rows(self):
+        return 0
+
+    def merge_insert(self, key):
+        self.merge_called = True
+        return self
+
+    def when_matched_update_all(self):
+        return self
+
+    def when_not_matched_insert_all(self):
+        return self
+
+    def execute(self, table):
+        return None
 
 
 class FakeState:
@@ -479,6 +502,34 @@ class BuildSelectSqlTest(unittest.TestCase):
         self.assertEqual(merge_rows.call_count, 2)
         refresh.assert_called_once()
         reconcile.assert_called_once_with(args, "records", "s3://bucket/tables/records.lance", fresh_schema)
+
+    def test_merge_incremental_rows_appends_when_target_is_empty(self):
+        import pyarrow as pa
+
+        schema = pa.schema(
+            [
+                pa.field("_id", pa.string()),
+                pa.field("_ts", pa.int64()),
+                pa.field("_deleted", pa.bool_()),
+                pa.field("__status", pa.int8()),
+                pa.field("__status_id", pa.string()),
+                pa.field("__id_ts", pa.string()),
+                pa.field("value", pa.string()),
+            ],
+        )
+        dataset = FakeEmptyMergeDataset(schema)
+
+        with (
+            patch("lance.dataset", return_value=dataset),
+            patch("lance.write_dataset") as write_dataset,
+            patch("convexlance.cli._existing_current_rows_native", return_value=[]),
+        ):
+            merged = merge_incremental_rows("records", "s3://bucket/tables/records.lance", [{"_id": "a", "_ts": 1, "_deleted": False, "value": "x"}])
+
+        self.assertEqual(merged, 1)
+        write_dataset.assert_called_once()
+        self.assertEqual(write_dataset.call_args.kwargs["mode"], "append")
+        self.assertFalse(dataset.merge_called)
 
 
 if __name__ == "__main__":

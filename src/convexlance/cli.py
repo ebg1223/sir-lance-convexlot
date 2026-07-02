@@ -1240,6 +1240,18 @@ def merge_incremental_rows(table_name: str, target_uri: str, rows: list[JsonMap]
     ensure_rows_fit_lance_schema(table_name, target_uri, merge_rows, dataset.schema)
     merge_rows = _coerce_rows_for_arrow_schema(merge_rows, dataset.schema)
     merge_table = pa.Table.from_pylist(merge_rows, schema=dataset.schema)
+    try:
+        row_count = dataset.count_rows()
+    except Exception:  # noqa: BLE001
+        row_count = None
+    if row_count == 0:
+        # For an empty target, append is equivalent to merge_insert (there are
+        # no matched rows). It also avoids a Lance/DataFusion spill failure seen
+        # when merge_insert is the first write into a newly created S3-backed
+        # table.
+        lance.write_dataset(merge_table, target_uri, mode="append")
+        log_event("lance_incremental_empty_table_appended", table=table_name, target_uri=target_uri, rows=len(merge_rows))
+        return len(merge_rows)
     dataset.merge_insert("__id_ts").when_matched_update_all().when_not_matched_insert_all().execute(merge_table)
     return len(merge_rows)
 
