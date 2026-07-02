@@ -344,6 +344,19 @@ class BuildSelectSqlTest(unittest.TestCase):
         self.assertFalse(by_name["leaseExpiresAt"].required)
         self.assertEqual(by_name["processedCount"].kind, "float64")
 
+    def test_schema_column_specs_keep_application_fields_nullable_even_when_required(self):
+        specs = schema_column_specs(
+            {
+                "type": "object",
+                "required": ["completedAt"],
+                "properties": {"completedAt": {"type": "string"}},
+            },
+        )
+
+        completed_at = {spec.name: spec for spec in specs}["completedAt"]
+        self.assertEqual(completed_at.kind, "string")
+        self.assertFalse(completed_at.required)
+
     def test_normalize_rows_for_specs_preserves_scalar_strings(self):
         rows = normalize_rows_for_specs(
             [{"json_col": "abc", "string_col": {"a": 1}, "int_col": "nope", "bool_col": "true"}],

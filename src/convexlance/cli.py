@@ -538,7 +538,12 @@ def schema_column_specs(table_schema: JsonMap) -> list[ColumnSpec]:
         if key in reserved or not isinstance(props[key], dict):
             continue
         kind, nullable, element_kind = infer_kind(props[key])
-        columns.append(ColumnSpec(key, kind, key in required and not nullable, element_kind))
+        # Convex object schemas can mark fields as required while individual
+        # deltas still carry null values for those fields. Lance enforces
+        # non-nullability on append, so schema-derived application fields must
+        # stay nullable. Keep required constraints only on our generated
+        # metadata columns above.
+        columns.append(ColumnSpec(key, kind, False, element_kind))
     return columns
 
 
