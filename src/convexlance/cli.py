@@ -17,6 +17,7 @@ from typing import Any
 import uuid
 from urllib.parse import urlencode, urljoin
 from urllib.request import Request, urlopen
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 JsonMap = dict[str, Any]
@@ -33,6 +34,17 @@ class MissingLanceColumns(RuntimeError):
         self.target_uri = target_uri
         self.columns = columns
         super().__init__(f"Lance table {table_name} at {target_uri} is missing incoming row columns: {columns}")
+
+
+@dataclass
+class BufferedDeltaPage:
+    page_number: int
+    start_cursor: str
+    end_cursor: str
+    rows_seen: int
+    rows_accepted: int
+    has_more: bool
+    rows_by_table: dict[str, list[JsonMap]]
 
 
 def log_event(event: str, **fields: Any) -> None:
@@ -724,6 +736,27 @@ def _audit_cursor_page(state: S3JsonState, lease: TableLease, page: int, start_c
         {
             "owner": lease.owner,
             "page": page,
+            "start_cursor": start_cursor,
+            "end_cursor": end_cursor,
+            "rows_seen": rows_seen,
+            "rows_accepted": rows_accepted,
+            "rows_merged": rows_merged,
+            "tables": table_rows,
+            "updated_at": now,
+        },
+    )
+
+
+def _audit_cursor_chunk(state: S3JsonState, lease: TableLease, start_page: int, end_page: int, start_cursor: str, end_cursor: str | None, table_rows: dict[str, int], rows_seen: int, rows_accepted: int, rows_merged: int) -> None:
+    now = int(time.time())
+    safe_start = "".join(ch if ch.isalnum() else "_" for ch in start_cursor)[:80]
+    safe_end = "".join(ch if ch.isalnum() else "_" for ch in str(end_cursor))[:80]
+    state.write(
+        f"incremental/chunk_audit/{now}-{start_page}-{end_page}-{safe_start}-{safe_end}.json",
+        {
+            "owner": lease.owner,
+            "start_page": start_page,
+            "end_page": end_page,
             "start_cursor": start_cursor,
             "end_cursor": end_cursor,
             "rows_seen": rows_seen,
@@ -1439,6 +1472,133 @@ def merge_incremental_rows_with_schema_refresh(
         return merged, refreshed_payload
 
 
+def flush_incremental_buffer(args, state, lease, client, bucket, schema_payload, cursor_etag, buffer) -> tuple[str, str, JsonMap, dict[str, int]]:
+    if not buffer:
+        current_payload, _ = state.read_with_etag(args.cursor_key)
+        current_cursor = str(current_payload["cursor"]) if current_payload and current_payload.get("cursor") is not None else cursor_etag
+        return current_cursor, cursor_etag, schema_payload, {}
+    rows_by_source_table: dict[str, list[JsonMap]] = {}
+    for page in buffer:
+        for source_table, table_rows in page.rows_by_table.items():
+            rows_by_source_table.setdefault(source_table, []).extend(table_rows)
+    start_cursor = buffer[0].start_cursor
+    end_cursor = buffer[-1].end_cursor
+    start_page = buffer[0].page_number
+    end_page = buffer[-1].page_number
+    rows_seen = sum(page.rows_seen for page in buffer)
+    rows_accepted = sum(page.rows_accepted for page in buffer)
+    chunk_failed_emitted = False
+
+    def _merge_worker(source_table, physical, target_uri, specs, table_rows):
+        merged, refreshed_payload = merge_incremental_rows_with_schema_refresh(
+            args,
+            state,
+            client,
+            schema_payload,
+            source_table,
+            physical,
+            target_uri,
+            table_rows,
+            specs,
+        )
+        return source_table, physical, table_rows, merged, refreshed_payload
+
+    try:
+        log_event(
+            "lance_incremental_merge_chunk_started",
+            pages=len(buffer),
+            rows_seen=rows_seen,
+            rows_accepted=rows_accepted,
+            tables=len(rows_by_source_table),
+            start_cursor=start_cursor,
+            end_cursor=end_cursor,
+        )
+        work = []
+        for source_table, table_rows in rows_by_source_table.items():
+            physical = source_to_physical_table(source_table)
+            target_uri = lance_uri(bucket, args.lance_prefix, physical)
+            specs = reconcile_lance_schema(args, physical, target_uri, table_schema_from_payload(schema_payload, source_table))
+            if specs == []:
+                continue
+            if args.table_config_indexes:
+                reconcile_table_config_for_dataset(args, physical, target_uri)
+            work.append((source_table, physical, target_uri, specs, table_rows))
+        results: list[tuple[str, str, list[JsonMap], int, JsonMap]] = []
+        concurrency = max(1, int(getattr(args, "merge_table_concurrency", 1) or 1))
+        if concurrency <= 1 or len(work) <= 1:
+            for item in work:
+                result = _merge_worker(*item)
+                if result[4] is not schema_payload:
+                    schema_payload = result[4]
+                results.append(result)
+        else:
+            first_exc: BaseException | None = None
+            with ThreadPoolExecutor(max_workers=concurrency) as ex:
+                future_to_item = {ex.submit(_merge_worker, *item): item for item in work}
+                for future in as_completed(future_to_item):
+                    try:
+                        result = future.result()
+                        results.append(result)
+                    except BaseException as exc:
+                        if first_exc is None:
+                            first_exc = exc
+            if first_exc is not None:
+                raise first_exc
+            for result in results:
+                if result[4] is not schema_payload:
+                    schema_payload = result[4]
+        total_merged = 0
+        rows_merged_by_source: dict[str, int] = {}
+        for source_table, physical, table_rows, merged, refreshed_payload in results:
+            rows_merged_by_source[source_table] = merged
+            total_merged += merged
+            log_event(
+                "lance_incremental_table_merged",
+                table=source_table,
+                physical_table=physical,
+                rows=len(table_rows),
+                merge_rows=merged,
+                pages=len(buffer),
+                start_cursor=start_cursor,
+                end_cursor=end_cursor,
+            )
+        verify_lease_owner(state, lease)
+        current_payload, current_etag = state.read_with_etag(args.cursor_key)
+        if current_payload is None or current_etag is None or str(current_payload.get("cursor")) != start_cursor or current_etag != cursor_etag:
+            raise RuntimeError(
+                f"Incremental cursor changed before chunk commit: expected cursor={start_cursor} etag={cursor_etag}, got payload={current_payload} etag={current_etag}"
+            )
+        merge_pages = int(getattr(args, "merge_pages", 1) or 1)
+        if merge_pages == 1 and len(buffer) == 1:
+            _audit_cursor_page(state, lease, end_page, start_cursor, end_cursor, rows_merged_by_source, rows_seen, rows_accepted, total_merged)
+        else:
+            _audit_cursor_chunk(state, lease, start_page, end_page, start_cursor, end_cursor, rows_merged_by_source, rows_seen, rows_accepted, total_merged)
+        new_etag = _write_incremental_cursor(state, args, end_cursor, cursor_etag, {"owner": lease.owner, "pages_processed": end_page, "previous_cursor": start_cursor})
+        heartbeat_lease(state, lease, args.lock_ttl_seconds)
+        log_event(
+            "lance_incremental_merge_chunk_completed",
+            pages=len(buffer),
+            rows_seen=rows_seen,
+            rows_accepted=rows_accepted,
+            rows_merged=total_merged,
+            tables=len(rows_merged_by_source),
+            start_cursor=start_cursor,
+            end_cursor=end_cursor,
+        )
+        return end_cursor, new_etag, schema_payload, rows_merged_by_source
+    except BaseException as exc:
+        if not chunk_failed_emitted:
+            log_event(
+                "lance_incremental_merge_chunk_failed",
+                pages=len(buffer),
+                start_cursor=start_cursor,
+                end_cursor=end_cursor,
+                error=repr(exc),
+            )
+            chunk_failed_emitted = True
+        raise
+
+
 def run_incremental_once(args: argparse.Namespace) -> JsonMap:
     bucket = env_or_arg(args, "lance_bucket", "LANCE_BUCKET")
     args.lance_scope = args.lance_scope or f"s3://{bucket}/"
@@ -1457,17 +1617,22 @@ def run_incremental_once(args: argparse.Namespace) -> JsonMap:
     else:
         schema_payload = {"schemas": {}}
     start_cursor = cursor
-    pages = rows_seen = rows_accepted = rows_merged = 0
+    pages = 0
+    rows_seen = 0
+    rows_accepted = 0
+    rows_merged = 0
     table_rows: dict[str, int] = {}
+    buffer: list[BufferedDeltaPage] = []
+    buffered_rows = 0
+    merge_pages = max(1, int(getattr(args, "merge_pages", 1) or 1))
+    merge_max_rows = int(getattr(args, "merge_max_rows", 5000) or 5000)
     try:
         for raw_rows, page_cursor, has_more in client.iter_document_deltas(cursor):
             pages += 1
             page_start_cursor = cursor
             page_rows_seen = len(raw_rows)
             page_rows_accepted = 0
-            page_rows_merged = 0
-            page_table_rows: dict[str, int] = {}
-            rows_seen += len(raw_rows)
+            rows_seen += page_rows_seen
             by_table: dict[str, list[JsonMap]] = {}
             for raw in raw_rows:
                 table_name = raw.get("_table")
@@ -1478,54 +1643,51 @@ def run_incremental_once(args: argparse.Namespace) -> JsonMap:
                 by_table.setdefault(table_name, []).append(row)
                 rows_accepted += 1
                 page_rows_accepted += 1
-            for source_table, table_page_rows in by_table.items():
-                physical = source_to_physical_table(source_table)
-                target_uri = lance_uri(bucket, args.lance_prefix, physical)
-                specs = reconcile_lance_schema(args, physical, target_uri, table_schema_from_payload(schema_payload, source_table))
-                if specs == []:
-                    continue
-                config_result = reconcile_table_config_for_dataset(args, physical, target_uri) if args.table_config_indexes else None
-                try:
-                    merged, schema_payload = merge_incremental_rows_with_schema_refresh(
-                        args,
-                        state,
-                        client,
-                        schema_payload,
-                        source_table,
-                        physical,
-                        target_uri,
-                        table_page_rows,
-                        specs,
-                    )
-                except Exception as exc:  # noqa: BLE001
+            buffered_page = BufferedDeltaPage(
+                page_number=pages,
+                start_cursor=page_start_cursor,
+                end_cursor=page_cursor,
+                rows_seen=page_rows_seen,
+                rows_accepted=page_rows_accepted,
+                has_more=has_more,
+                rows_by_table=by_table,
+            )
+            buffer.append(buffered_page)
+            buffered_rows += page_rows_accepted
+            cursor = page_cursor
+            log_event(
+                "lance_incremental_page_buffered",
+                page=pages,
+                values=page_rows_seen,
+                accepted=page_rows_accepted,
+                cursor=page_cursor,
+                has_more=has_more,
+            )
+            should_flush = (
+                len(buffer) >= merge_pages
+                or buffered_rows >= merge_max_rows
+                or pages >= args.max_pages_per_sync
+                or not has_more
+            )
+            if should_flush and buffer:
+                last_page = buffer[-1]
+                cursor, cursor_etag, schema_payload, chunk_merged = flush_incremental_buffer(
+                    args, state, lease, client, bucket, schema_payload, cursor_etag, buffer
+                )
+                for source_table, merged in chunk_merged.items():
+                    table_rows[source_table] = table_rows.get(source_table, 0) + merged
+                    rows_merged += merged
+                buffer.clear()
+                buffered_rows = 0
+                if merge_pages == 1:
                     log_event(
-                        "lance_incremental_table_merge_failed",
-                        table=source_table,
-                        physical_table=physical,
-                        target_uri=target_uri,
-                        rows=len(table_page_rows),
-                        cursor=page_cursor,
-                        page=pages,
-                        error=repr(exc),
+                        "lance_incremental_page",
+                        page=last_page.page_number,
+                        values=last_page.rows_seen,
+                        accepted=last_page.rows_accepted,
+                        cursor=last_page.end_cursor,
+                        has_more=last_page.has_more,
                     )
-                    raise
-                rows_merged += merged
-                page_rows_merged += merged
-                table_rows[source_table] = table_rows.get(source_table, 0) + merged
-                page_table_rows[source_table] = page_table_rows.get(source_table, 0) + merged
-                log_event("lance_incremental_table_merged", table=source_table, physical_table=physical, rows=len(table_page_rows), merge_rows=merged, cursor=page_cursor, table_config=config_result)
-            if page_cursor is not None:
-                verify_lease_owner(state, lease)
-                current_payload, current_etag = state.read_with_etag(args.cursor_key)
-                if current_payload is None or current_etag is None or str(current_payload.get("cursor")) != page_start_cursor or current_etag != cursor_etag:
-                    raise RuntimeError(
-                        f"Incremental cursor changed before page commit: expected cursor={page_start_cursor} etag={cursor_etag}, got payload={current_payload} etag={current_etag}"
-                    )
-                _audit_cursor_page(state, lease, pages, page_start_cursor, page_cursor, page_table_rows, page_rows_seen, page_rows_accepted, page_rows_merged)
-                cursor = page_cursor
-                cursor_etag = _write_incremental_cursor(state, args, cursor, cursor_etag, {"owner": lease.owner, "pages_processed": pages, "previous_cursor": page_start_cursor})
-            heartbeat_lease(state, lease, args.lock_ttl_seconds)
-            log_event("lance_incremental_page", page=pages, values=len(raw_rows), accepted=sum(len(v) for v in by_table.values()), cursor=cursor, has_more=has_more)
             if pages >= args.max_pages_per_sync or not has_more:
                 break
         state.delete("incremental/last_error.json")
@@ -2916,6 +3078,9 @@ def build_parser() -> argparse.ArgumentParser:
     incremental.add_argument("--lance-scope")
     incremental.add_argument("--catalog-alias")
     incremental.add_argument("--max-pages-per-sync", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_MAX_PAGES_PER_SYNC", "100")))
+    incremental.add_argument("--merge-pages", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_MERGE_PAGES", "1")))
+    incremental.add_argument("--merge-max-rows", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_MERGE_MAX_ROWS", "5000")))
+    incremental.add_argument("--merge-table-concurrency", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_MERGE_TABLE_CONCURRENCY", "1")))
     incremental.add_argument("--lock-ttl-seconds", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_LOCK_TTL_SECONDS", "300")))
     incremental.add_argument("--force", action=argparse.BooleanOptionalAction, default=False)
     incremental.add_argument("--duckdb-path", default=os.environ.get("LANCE_INCREMENTAL_DUCKDB_PATH", "/tmp/lance-incremental.duckdb"))
@@ -2954,6 +3119,9 @@ def build_parser() -> argparse.ArgumentParser:
     incremental_loop.add_argument("--lance-scope")
     incremental_loop.add_argument("--catalog-alias")
     incremental_loop.add_argument("--max-pages-per-sync", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_MAX_PAGES_PER_SYNC", "100")))
+    incremental_loop.add_argument("--merge-pages", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_MERGE_PAGES", "1")))
+    incremental_loop.add_argument("--merge-max-rows", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_MERGE_MAX_ROWS", "5000")))
+    incremental_loop.add_argument("--merge-table-concurrency", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_MERGE_TABLE_CONCURRENCY", "1")))
     incremental_loop.add_argument("--sleep-seconds", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_SLEEP_SECONDS", "20")))
     incremental_loop.add_argument("--optimize-touched-indices", action=argparse.BooleanOptionalAction, default=os.environ.get("LANCE_INCREMENTAL_OPTIMIZE_TOUCHED_INDICES", "true").lower() not in {"0", "false", "no"})
     incremental_loop.add_argument("--optimize-indices-pages", type=int, default=int(os.environ.get("LANCE_INCREMENTAL_OPTIMIZE_INDICES_PAGES", "50")))
