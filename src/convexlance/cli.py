@@ -1489,7 +1489,8 @@ def flush_incremental_buffer(args, state, lease, client, bucket, schema_payload,
     rows_accepted = sum(page.rows_accepted for page in buffer)
     chunk_failed_emitted = False
 
-    def _merge_worker(source_table, physical, target_uri, specs, table_rows):
+    def _merge_worker_refresh(source_table, physical, target_uri, specs, table_rows):
+        nonlocal schema_payload
         merged, refreshed_payload = merge_incremental_rows_with_schema_refresh(
             args,
             state,
@@ -1501,7 +1502,13 @@ def flush_incremental_buffer(args, state, lease, client, bucket, schema_payload,
             table_rows,
             specs,
         )
+        if refreshed_payload is not schema_payload:
+            schema_payload = refreshed_payload
         return source_table, physical, table_rows, merged, refreshed_payload
+
+    def _merge_worker_plain(source_table, physical, target_uri, specs, table_rows):
+        merged = merge_incremental_rows(physical, target_uri, table_rows, specs)
+        return source_table, physical, table_rows, merged, schema_payload
 
     try:
         log_event(
@@ -1527,26 +1534,40 @@ def flush_incremental_buffer(args, state, lease, client, bucket, schema_payload,
         concurrency = max(1, int(getattr(args, "merge_table_concurrency", 1) or 1))
         if concurrency <= 1 or len(work) <= 1:
             for item in work:
-                result = _merge_worker(*item)
-                if result[4] is not schema_payload:
-                    schema_payload = result[4]
-                results.append(result)
+                results.append(_merge_worker_refresh(*item))
         else:
+            # Parallel workers use the plain merge (no shared schema mutation).
+            # If any table is missing columns, abort the chunk, refresh the
+            # schema once in the main thread, and retry the whole chunk
+            # sequentially through the refreshing path.
             first_exc: BaseException | None = None
+            missing_columns = False
+            parallel_results: list[tuple[str, str, list[JsonMap], int, JsonMap]] = []
             with ThreadPoolExecutor(max_workers=concurrency) as ex:
-                future_to_item = {ex.submit(_merge_worker, *item): item for item in work}
+                future_to_item = {ex.submit(_merge_worker_plain, *item): item for item in work}
                 for future in as_completed(future_to_item):
                     try:
-                        result = future.result()
-                        results.append(result)
+                        parallel_results.append(future.result())
+                    except MissingLanceColumns:
+                        missing_columns = True
                     except BaseException as exc:
                         if first_exc is None:
                             first_exc = exc
             if first_exc is not None:
                 raise first_exc
-            for result in results:
-                if result[4] is not schema_payload:
-                    schema_payload = result[4]
+            if missing_columns:
+                if not args.reconcile_schema:
+                    raise MissingLanceColumns(work[0][1], work[0][2], [])
+                log_event("lance_incremental_merge_chunk_schema_refresh_retry", pages=len(buffer), tables=len(work), start_cursor=start_cursor, end_cursor=end_cursor)
+                schema_payload, _refreshed = incremental_schema_payload_with_status(state, args, client, force_refresh=True)
+                results = []
+                for source_table, physical, target_uri, _specs, table_rows in work:
+                    specs = reconcile_lance_schema(args, physical, target_uri, table_schema_from_payload(schema_payload, source_table))
+                    if specs == []:
+                        continue
+                    results.append(_merge_worker_refresh(source_table, physical, target_uri, specs, table_rows))
+            else:
+                results = parallel_results
         total_merged = 0
         rows_merged_by_source: dict[str, int] = {}
         for source_table, physical, table_rows, merged, refreshed_payload in results:
@@ -1670,24 +1691,29 @@ def run_incremental_once(args: argparse.Namespace) -> JsonMap:
                 or not has_more
             )
             if should_flush and buffer:
-                last_page = buffer[-1]
                 cursor, cursor_etag, schema_payload, chunk_merged = flush_incremental_buffer(
                     args, state, lease, client, bucket, schema_payload, cursor_etag, buffer
                 )
                 for source_table, merged in chunk_merged.items():
                     table_rows[source_table] = table_rows.get(source_table, 0) + merged
                     rows_merged += merged
-                buffer.clear()
-                buffered_rows = 0
-                if merge_pages == 1:
+                # Emit a per-page event for every committed page so dashboards
+                # keyed on lance_incremental_page keep working under batching.
+                # Single-page chunks match the legacy event exactly; multi-page
+                # chunks carry buffered=True to flag chunk-level commit.
+                chunk_buffered = len(buffer) > 1
+                for committed_page in buffer:
                     log_event(
                         "lance_incremental_page",
-                        page=last_page.page_number,
-                        values=last_page.rows_seen,
-                        accepted=last_page.rows_accepted,
-                        cursor=last_page.end_cursor,
-                        has_more=last_page.has_more,
+                        page=committed_page.page_number,
+                        values=committed_page.rows_seen,
+                        accepted=committed_page.rows_accepted,
+                        cursor=committed_page.end_cursor,
+                        has_more=committed_page.has_more,
+                        buffered=chunk_buffered,
                     )
+                buffer.clear()
+                buffered_rows = 0
             if pages >= args.max_pages_per_sync or not has_more:
                 break
         state.delete("incremental/last_error.json")
