@@ -889,6 +889,12 @@ class FakeConvexClient:
 
 
 class BufferedIncrementalMergeTest(unittest.TestCase):
+    def setUp(self):
+        self.events = []
+
+    def _record_event(self, event, **fields):
+        self.events.append((event, fields))
+
     @contextmanager
     def _patched_run(self, state, client, merge_side_effect=None, plain_merge_side_effect=None):
         merge_mock = (
@@ -911,7 +917,7 @@ class BufferedIncrementalMergeTest(unittest.TestCase):
             patch("convexlance.cli.reconcile_lance_schema", return_value=[ColumnSpec("value", "string")]),
             patch("convexlance.cli.merge_incremental_rows_with_schema_refresh", merge_mock),
             patch("convexlance.cli.merge_incremental_rows", plain_merge_mock),
-            patch("convexlance.cli.log_event"),
+            patch("convexlance.cli.log_event", side_effect=self._record_event),
         ):
             yield merge_mock, plain_merge_mock
 
@@ -1125,6 +1131,66 @@ class BufferedIncrementalMergeTest(unittest.TestCase):
         audit_keys = list(state.values.keys())
         self.assertTrue(any("page_audit" in k for k in audit_keys))
         self.assertFalse(any("chunk_audit" in k for k in audit_keys))
+
+    def _page_events(self):
+        return [fields for event, fields in self.events if event == "lance_incremental_page"]
+
+    def test_single_page_event_omits_buffered_field(self):
+        pages = [([{"_table": "T", "_id": "r1", "_ts": 1, "_deleted": False}], "cursor-1", False)]
+        client = FakeConvexClient(pages)
+        state = FakeCursorState()
+        state.seed("incremental/cursor.json", {"cursor": "cursor-0"})
+        args = self._base_args(merge_pages=1, merge_max_rows=10000, merge_table_concurrency=1)
+
+        with self._patched_run(state, client):
+            run_incremental_once(args)
+
+        page_events = self._page_events()
+        self.assertEqual(len(page_events), 1)
+        self.assertNotIn("buffered", page_events[0])
+
+    def test_multi_page_chunk_events_flag_buffered(self):
+        pages = [
+            ([{"_table": "T", "_id": "r1", "_ts": 1, "_deleted": False}], "cursor-1", True),
+            ([{"_table": "T", "_id": "r2", "_ts": 2, "_deleted": False}], "cursor-2", False),
+        ]
+        client = FakeConvexClient(pages)
+        state = FakeCursorState()
+        state.seed("incremental/cursor.json", {"cursor": "cursor-0"})
+        args = self._base_args(merge_pages=10, merge_max_rows=10000, merge_table_concurrency=1)
+
+        with self._patched_run(state, client):
+            run_incremental_once(args)
+
+        page_events = self._page_events()
+        self.assertEqual(len(page_events), 2)
+        self.assertTrue(all(fields.get("buffered") is True for fields in page_events))
+
+    def test_parallel_missing_columns_reraises_original_when_reconcile_disabled(self):
+        def fake_plain_merge(physical, target_uri, table_rows, specs):
+            raise MissingLanceColumns(physical, target_uri, ["newField"])
+
+        pages = [
+            (
+                [
+                    {"_table": "A", "_id": "a1", "_ts": 1, "_deleted": False},
+                    {"_table": "B", "_id": "b1", "_ts": 1, "_deleted": False},
+                ],
+                "cursor-1",
+                False,
+            ),
+        ]
+        client = FakeConvexClient(pages)
+        state = FakeCursorState()
+        state.seed("incremental/cursor.json", {"cursor": "cursor-0"})
+        args = self._base_args(merge_pages=10, merge_max_rows=10000, merge_table_concurrency=2, reconcile_schema=False)
+
+        with self._patched_run(state, client, plain_merge_side_effect=fake_plain_merge):
+            with self.assertRaises(MissingLanceColumns) as ctx:
+                run_incremental_once(args)
+
+        self.assertEqual(ctx.exception.columns, ["newField"])
+        self.assertEqual(state.write_if_match.call_count, 0)
 
 
 class PrepareIncrementalMergeRowsTest(unittest.TestCase):

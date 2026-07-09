@@ -1541,6 +1541,7 @@ def flush_incremental_buffer(args, state, lease, client, bucket, schema_payload,
             # schema once in the main thread, and retry the whole chunk
             # sequentially through the refreshing path.
             first_exc: BaseException | None = None
+            first_missing_exc: MissingLanceColumns | None = None
             missing_columns = False
             parallel_results: list[tuple[str, str, list[JsonMap], int, JsonMap]] = []
             with ThreadPoolExecutor(max_workers=concurrency) as ex:
@@ -1548,8 +1549,10 @@ def flush_incremental_buffer(args, state, lease, client, bucket, schema_payload,
                 for future in as_completed(future_to_item):
                     try:
                         parallel_results.append(future.result())
-                    except MissingLanceColumns:
+                    except MissingLanceColumns as exc:
                         missing_columns = True
+                        if first_missing_exc is None:
+                            first_missing_exc = exc
                     except BaseException as exc:
                         if first_exc is None:
                             first_exc = exc
@@ -1557,7 +1560,7 @@ def flush_incremental_buffer(args, state, lease, client, bucket, schema_payload,
                 raise first_exc
             if missing_columns:
                 if not args.reconcile_schema:
-                    raise MissingLanceColumns(work[0][1], work[0][2], [])
+                    raise first_missing_exc
                 log_event("lance_incremental_merge_chunk_schema_refresh_retry", pages=len(buffer), tables=len(work), start_cursor=start_cursor, end_cursor=end_cursor)
                 schema_payload, _refreshed = incremental_schema_payload_with_status(state, args, client, force_refresh=True)
                 results = []
@@ -1703,15 +1706,16 @@ def run_incremental_once(args: argparse.Namespace) -> JsonMap:
                 # chunks carry buffered=True to flag chunk-level commit.
                 chunk_buffered = len(buffer) > 1
                 for committed_page in buffer:
-                    log_event(
-                        "lance_incremental_page",
-                        page=committed_page.page_number,
-                        values=committed_page.rows_seen,
-                        accepted=committed_page.rows_accepted,
-                        cursor=committed_page.end_cursor,
-                        has_more=committed_page.has_more,
-                        buffered=chunk_buffered,
-                    )
+                    page_fields = {
+                        "page": committed_page.page_number,
+                        "values": committed_page.rows_seen,
+                        "accepted": committed_page.rows_accepted,
+                        "cursor": committed_page.end_cursor,
+                        "has_more": committed_page.has_more,
+                    }
+                    if chunk_buffered:
+                        page_fields["buffered"] = True
+                    log_event("lance_incremental_page", **page_fields)
                 buffer.clear()
                 buffered_rows = 0
             if pages >= args.max_pages_per_sync or not has_more:
